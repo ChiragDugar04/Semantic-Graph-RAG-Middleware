@@ -1,0 +1,133 @@
+# ============================================================
+# INTENT REGISTRY
+# Each intent maps a user question category to a safe,
+# pre-written parameterized SQL template.
+# The LLM never writes SQL — it only picks an intent name.
+# ============================================================
+
+intents:
+
+  employee_salary:
+    description: "Get salary and role information for a specific employee"
+    sql_template: >
+      SELECT e.name, e.role, e.salary, e.hire_date, d.name AS department
+      FROM employees e
+      JOIN departments d ON e.department_id = d.id
+      WHERE e.name LIKE %(name)s
+    required_params:
+      - name
+    optional_params: []
+    result_description: "Employee salary and role details"
+
+  employee_list:
+    description: "List all employees in a specific department"
+    sql_template: >
+      SELECT e.name, e.role, e.salary, e.hire_date
+      FROM employees e
+      JOIN departments d ON e.department_id = d.id
+      WHERE d.name LIKE %(department_name)s
+      ORDER BY e.name
+    required_params:
+      - department_name
+    optional_params: []
+    result_description: "List of employees in a department"
+
+  department_budget:
+    description: "Get budget, location and headcount for a specific department"
+    sql_template: >
+      SELECT d.name, d.budget, d.location,
+             COUNT(e.id) AS headcount,
+             mgr.name AS manager_name
+      FROM departments d
+      LEFT JOIN employees e ON e.department_id = d.id
+      LEFT JOIN employees mgr ON d.manager_id = mgr.id
+      WHERE d.name LIKE %(department_name)s
+      GROUP BY d.id, d.name, d.budget, d.location, mgr.name
+    required_params:
+      - department_name
+    optional_params: []
+    result_description: "Department budget and headcount info"
+
+  department_list:
+    description: "List all departments with their budgets and headcounts"
+    sql_template: >
+      SELECT d.name, d.budget, d.location,
+             COUNT(e.id) AS headcount
+      FROM departments d
+      LEFT JOIN employees e ON e.department_id = d.id
+      GROUP BY d.id, d.name, d.budget, d.location
+      ORDER BY d.budget DESC
+    required_params: []
+    optional_params: []
+    result_description: "All departments with budget and size"
+
+  product_stock:
+    description: "Get stock level and pricing for a specific product"
+    sql_template: >
+      SELECT name, category, price, stock_quantity, supplier
+      FROM products
+      WHERE name LIKE %(product_name)s
+    required_params:
+      - product_name
+    optional_params: []
+    result_description: "Product stock and pricing details"
+
+  product_list:
+    description: "List all products in a specific category"
+    sql_template: >
+      SELECT name, price, stock_quantity, supplier
+      FROM products
+      WHERE category LIKE %(category)s
+      ORDER BY stock_quantity DESC
+    required_params:
+      - category
+    optional_params: []
+    result_description: "Products in a category"
+
+  order_history:
+    description: "Get recent orders with product and employee details"
+    sql_template: >
+      SELECT o.id AS order_id, p.name AS product, o.quantity,
+             o.order_date, o.status, e.name AS ordered_by
+      FROM orders o
+      JOIN products p ON o.product_id = p.id
+      JOIN employees e ON o.employee_id = e.id
+      ORDER BY o.order_date DESC
+      LIMIT 20
+    required_params: []
+    optional_params: []
+    result_description: "Recent order history"
+
+  order_by_status:
+    description: "Get orders filtered by their status"
+    sql_template: >
+      SELECT o.id AS order_id, p.name AS product, o.quantity,
+             o.order_date, e.name AS ordered_by
+      FROM orders o
+      JOIN products p ON o.product_id = p.id
+      JOIN employees e ON o.employee_id = e.id
+      WHERE o.status = %(status)s
+      ORDER BY o.order_date DESC
+    required_params:
+      - status
+    optional_params: []
+    result_description: "Orders filtered by status"
+
+# Fallback — when no intent matches
+  other:
+    description: "Question does not match any known database query"
+    sql_template: ""
+    required_params: []
+    optional_params: []
+    result_description: "No matching query available"
+
+
+# MODEL ROUTING CONFIG
+models:
+  fast_model: "qwen2.5:1.5b"        # Used for intent classification + param extraction
+  synthesis_model: "llama3.2:3b"    # Used for answer synthesis + self-healing messages
+  ollama_base_url: "http://localhost:11434"
+  intent_temperature: 0.0            # Zero — we want deterministic classification
+  synthesis_temperature: 0.3         # Slight warmth for natural language output
+  max_tokens_intent: 50              # Intent is ONE word — cap tokens
+  max_tokens_synthesis: 500          # Full answer

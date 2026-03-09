@@ -1,0 +1,10 @@
+database:
+  host: "localhost"
+  port: 3306
+  user: "root"          # change this to your MySQL username
+  password: "password"   # change this to your MySQL password
+  database: "middleware_poc"
+
+connection_pool:
+  pool_size: 3
+  connection_timeout: 30

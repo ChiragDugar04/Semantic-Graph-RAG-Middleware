@@ -2,19 +2,13 @@
 CREATE DATABASE IF NOT EXISTS middleware_poc;
 USE middleware_poc;
 
--- Drop tables in reverse FK order if re-running
-DROP TABLE IF EXISTS orders;
-DROP TABLE IF EXISTS products;
-DROP TABLE IF EXISTS employees;
-DROP TABLE IF EXISTS departments;
-
 
 CREATE TABLE departments (
     id          INT AUTO_INCREMENT PRIMARY KEY,
     name        VARCHAR(100) NOT NULL UNIQUE,
     budget      DECIMAL(12, 2) NOT NULL,
     location    VARCHAR(100) NOT NULL,
-    manager_id  INT NULL   -- FK to employees, set via ALTER below
+    manager_id  INT NULL
 );
 
 
@@ -62,4 +56,36 @@ CREATE TABLE orders (
         REFERENCES products(id) ON DELETE RESTRICT,
     CONSTRAINT fk_order_employee FOREIGN KEY (employee_id)
         REFERENCES employees(id) ON DELETE RESTRICT
+);
+
+
+CREATE TABLE projects (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(150) NOT NULL UNIQUE,
+    description   TEXT,
+    budget        DECIMAL(12, 2) NOT NULL,
+    start_date    DATE NOT NULL,
+    end_date      DATE NULL,
+    status        ENUM('planning', 'active', 'completed', 'on_hold')
+                  NOT NULL DEFAULT 'active',
+    department_id INT NOT NULL,
+    manager_id    INT NOT NULL,
+    CONSTRAINT fk_project_dept    FOREIGN KEY (department_id)
+        REFERENCES departments(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_project_manager FOREIGN KEY (manager_id)
+        REFERENCES employees(id)   ON DELETE RESTRICT
+);
+
+
+CREATE TABLE project_assignments (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    project_id       INT NOT NULL,
+    employee_id      INT NOT NULL,
+    role_on_project  VARCHAR(100) NOT NULL,
+    assigned_date    DATE NOT NULL,
+    CONSTRAINT fk_pa_project  FOREIGN KEY (project_id)
+        REFERENCES projects(id)   ON DELETE CASCADE,
+    CONSTRAINT fk_pa_employee FOREIGN KEY (employee_id)
+        REFERENCES employees(id)  ON DELETE CASCADE,
+    CONSTRAINT uq_pa_assignment UNIQUE (project_id, employee_id)
 );

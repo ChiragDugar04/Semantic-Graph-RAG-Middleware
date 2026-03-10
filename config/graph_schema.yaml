@@ -1,0 +1,244 @@
+# ============================================================
+# SEMANTIC GRAPH SCHEMA
+# Defines the knowledge graph of database entities and their
+# relationships. This is the single source of truth for the
+# SemanticGraph class in middleware/semantic_graph.py
+#
+# To add a new entity:
+#   1. Add a node entry below
+#   2. Add edge entries describing its relationships
+#   3. Zero Python changes required
+# ============================================================
+
+nodes:
+
+  Employee:
+    table: employees
+    alias: e
+    display_name: "Employee"
+    # Columns that can appear in SELECT
+    selectable_columns:
+      - column: name
+        alias: employee_name
+        label: "Employee Name"
+      - column: role
+        alias: employee_role
+        label: "Role"
+      - column: salary
+        alias: salary
+        label: "Salary"
+        is_currency: true
+      - column: hire_date
+        alias: hire_date
+        label: "Hire Date"
+      - column: email
+        alias: email
+        label: "Email"
+    # Columns that can appear in WHERE filters
+    filterable_columns:
+      name:
+        match_type: like        # uses LIKE %value%
+        sql_column: e.name
+      role:
+        match_type: like
+        sql_column: e.role
+      salary:
+        match_type: exact
+        sql_column: e.salary
+    # The primary key used in JOINs
+    primary_key: id
+    primary_key_sql: e.id
+
+  Department:
+    table: departments
+    alias: d
+    display_name: "Department"
+    selectable_columns:
+      - column: name
+        alias: department_name
+        label: "Department Name"
+      - column: budget
+        alias: budget
+        label: "Budget"
+        is_currency: true
+      - column: location
+        alias: location
+        label: "Location"
+    filterable_columns:
+      name:
+        match_type: like
+        sql_column: d.name
+      budget:
+        match_type: exact
+        sql_column: d.budget
+      location:
+        match_type: like
+        sql_column: d.location
+    primary_key: id
+    primary_key_sql: d.id
+
+  Product:
+    table: products
+    alias: p
+    display_name: "Product"
+    selectable_columns:
+      - column: name
+        alias: product_name
+        label: "Product Name"
+      - column: category
+        alias: category
+        label: "Category"
+      - column: price
+        alias: price
+        label: "Price"
+        is_currency: true
+      - column: stock_quantity
+        alias: stock_quantity
+        label: "Stock"
+      - column: supplier
+        alias: supplier
+        label: "Supplier"
+    filterable_columns:
+      name:
+        match_type: like
+        sql_column: p.name
+      category:
+        match_type: exact
+        sql_column: p.category
+      price:
+        match_type: exact
+        sql_column: p.price
+    primary_key: id
+    primary_key_sql: p.id
+
+  Order:
+    table: orders
+    alias: o
+    display_name: "Order"
+    selectable_columns:
+      - column: id
+        alias: order_id
+        label: "Order ID"
+      - column: quantity
+        alias: quantity
+        label: "Quantity"
+      - column: order_date
+        alias: order_date
+        label: "Order Date"
+      - column: status
+        alias: status
+        label: "Status"
+    filterable_columns:
+      status:
+        match_type: exact
+        sql_column: o.status
+      order_date:
+        match_type: exact
+        sql_column: o.order_date
+    primary_key: id
+    primary_key_sql: o.id
+
+  Project:
+    table: projects
+    alias: proj
+    display_name: "Project"
+    selectable_columns:
+      - column: name
+        alias: project_name
+        label: "Project Name"
+      - column: description
+        alias: description
+        label: "Description"
+      - column: budget
+        alias: project_budget
+        label: "Budget"
+        is_currency: true
+      - column: status
+        alias: project_status
+        label: "Status"
+      - column: start_date
+        alias: start_date
+        label: "Start Date"
+      - column: end_date
+        alias: end_date
+        label: "End Date"
+    filterable_columns:
+      name:
+        match_type: like
+        sql_column: proj.name
+      status:
+        match_type: exact
+        sql_column: proj.status
+    primary_key: id
+    primary_key_sql: proj.id
+
+
+# ============================================================
+# EDGES — Relationships between entities
+#
+# Each edge defines:
+#   from_node     : source entity
+#   to_node       : target entity
+#   relation      : human-readable relationship label
+#   join_type     : INNER or LEFT
+#   join_condition: the ON clause (using table aliases from nodes)
+#   junction_table: (optional) for many-to-many via a bridge table
+#   junction_alias: alias for the junction table in SQL
+#   notes         : explanation for developers
+# ============================================================
+
+edges:
+
+  - from_node: Employee
+    to_node: Department
+    relation: works_in
+    join_type: INNER
+    join_condition: "e.department_id = d.id"
+    notes: "An employee belongs to exactly one department"
+
+  - from_node: Department
+    to_node: Employee
+    relation: managed_by
+    join_type: LEFT
+    join_condition: "d.manager_id = e.id"
+    notes: "A department has one manager (an employee). Use alias mgr for manager employee."
+    manager_join: true   # flag: JOIN employees twice, second with alias 'mgr'
+
+  - from_node: Employee
+    to_node: Project
+    relation: assigned_to
+    join_type: INNER
+    junction_table: project_assignments
+    junction_alias: pa
+    join_condition: "e.id = pa.employee_id AND pa.project_id = proj.id"
+    extra_select:
+      - "pa.role_on_project AS assignment_role"
+    notes: "Many-to-many via project_assignments junction table"
+
+  - from_node: Project
+    to_node: Employee
+    relation: managed_by_employee
+    join_type: INNER
+    join_condition: "proj.manager_id = e.id"
+    notes: "A project has one manager (an employee)"
+
+  - from_node: Project
+    to_node: Department
+    relation: owned_by
+    join_type: INNER
+    join_condition: "proj.department_id = d.id"
+    notes: "A project is owned by a primary department"
+
+  - from_node: Order
+    to_node: Employee
+    relation: placed_by
+    join_type: INNER
+    join_condition: "o.employee_id = e.id"
+    notes: "An order was placed by an employee"
+
+  - from_node: Order
+    to_node: Product
+    relation: contains
+    join_type: INNER
+    join_condition: "o.product_id = p.id"
+    notes: "An order is for a specific product"

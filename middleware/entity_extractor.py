@@ -274,6 +274,18 @@ def _rule_based_extraction(question: str) -> Optional[EntityExtractionResult]:
         if order_status:
             filters["order_status"] = order_status
 
+
+    # ── Detect project status ────────────────────────────────
+    _PROJECT_STATUS_MAP = {
+        "in progress": "active", "ongoing": "active", "current": "active",
+        "active": "active", "completed": "completed", "finished": "completed",
+        "planned": "planned", "upcoming": "planned",
+    }
+    for _pkw, _pval in sorted(_PROJECT_STATUS_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+        if _pkw in q and "Project" in entities:
+            filters["project_status"] = _pval
+            break
+
     # ── Detect question type ──────────────────────────────────
     # FIX 4: Check aggregation first, then comparison (longest phrases first)
     for kw in _AGGREGATION_KEYWORDS:

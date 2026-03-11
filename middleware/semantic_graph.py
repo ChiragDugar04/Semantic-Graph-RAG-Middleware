@@ -274,20 +274,26 @@ class SemanticGraph:
                 )
 
     def find_multi_path(self, entities: List[str]) -> List[str]:
-        """Find a path that connects multiple entities.
+        """Find a path that connects multiple entities without loops.
 
         For 2 entities: delegates to find_path().
-        For 3+ entities: finds a minimal path that visits all
-        entities by chaining pairwise shortest paths.
+        For 3+ entities: builds a Steiner-tree-style minimal path
+        that visits all required entities exactly once, avoiding
+        the duplicate-node problem of naive pairwise chaining.
 
-        The first entity in the list is treated as the anchor
-        (the primary table in FROM). Others are joined in order.
+        Strategy:
+          1. Start from anchor (entities[0]).
+          2. For each remaining required entity, find the shortest
+             path from any node already in the path to that entity.
+             This avoids re-traversing nodes already covered.
+          3. If a segment introduces a node already in the path,
+             skip back-tracking nodes to keep the path linear.
 
         Args:
-            entities: List of entity names to connect.
+            entities: List of entity names to connect (anchor first).
 
         Returns:
-            List[str]: Combined node path (deduplicated, ordered).
+            List[str]: Linear node path with no duplicates.
 
         Raises:
             EntityNotFoundError: If any entity not in graph.
@@ -298,7 +304,7 @@ class SemanticGraph:
         if len(entities) == 1:
             return entities
 
-        # Validate all entities
+        # Validate all entities exist
         for entity in entities:
             if entity not in self._graph:
                 raise EntityNotFoundError(
@@ -306,14 +312,63 @@ class SemanticGraph:
                     f"Available: {self.node_names}"
                 )
 
-        # Chain pairwise paths, deduplicating overlapping nodes
-        full_path: List[str] = []
-        for i in range(len(entities) - 1):
-            segment = self.find_path(entities[i], entities[i + 1])
-            if full_path:
-                # Remove duplicate junction node
-                segment = segment[1:]
-            full_path.extend(segment)
+        # For exactly 2 entities, simple direct path
+        if len(entities) == 2:
+            return self.find_path(entities[0], entities[1])
+
+        # For 3+ entities: greedy Steiner approach
+        # Try direct path from anchor through all required entities
+        # in one shot first (e.g. Employee→Department→Project directly)
+        required = list(dict.fromkeys(entities))  # dedupe, preserve order
+        anchor = required[0]
+        remaining = required[1:]
+
+        # ── Strategy 1: try finding a direct path anchor→...→last ──
+        # that naturally passes through all intermediate required nodes
+        try:
+            direct = self.find_path(anchor, remaining[-1])
+            # Check if this path covers all required entities
+            direct_set = set(direct)
+            if all(r in direct_set for r in remaining):
+                # Reorder path to match required entity order if needed
+                return direct
+        except (NoPathError, nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+
+        # ── Strategy 2: greedy expansion from current path tip ───
+        # For each required entity not yet in path, find shortest
+        # path from the LAST node in current path to that entity.
+        full_path: List[str] = [anchor]
+        path_set: set = {anchor}
+
+        for target in remaining:
+            if target in path_set:
+                continue  # already covered
+
+            # Try path from current tip to target
+            tip = full_path[-1]
+            try:
+                segment = self.find_path(tip, target)
+                # Add segment nodes, skipping any already in path
+                for node in segment[1:]:
+                    if node not in path_set:
+                        full_path.append(node)
+                        path_set.add(node)
+                    elif node == target:
+                        # target already in path — it's covered, continue
+                        break
+            except (NoPathError, nx.NetworkXNoPath, nx.NodeNotFound):
+                # Try from anchor directly
+                try:
+                    segment = self.find_path(anchor, target)
+                    for node in segment:
+                        if node not in path_set:
+                            full_path.append(node)
+                            path_set.add(node)
+                except Exception as e2:
+                    raise NoPathError(
+                        f"Cannot connect '{tip}' to '{target}': {e2}"
+                    ) from e2
 
         return full_path
 

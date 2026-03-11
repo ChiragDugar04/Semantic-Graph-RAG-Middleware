@@ -229,6 +229,13 @@ edges:
     join_condition: "proj.department_id = d.id"
     notes: "A project is owned by a primary department"
 
+  - from_node: Department
+    to_node: Project
+    relation: has_projects
+    join_type: INNER
+    join_condition: "d.id = proj.department_id"
+    notes: "A department owns multiple projects (reverse of owned_by for graph traversal)"
+
   - from_node: Order
     to_node: Employee
     relation: placed_by

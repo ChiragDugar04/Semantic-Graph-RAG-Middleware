@@ -125,7 +125,7 @@ intents:
 # MODEL ROUTING CONFIG
 models:
   fast_model: "qwen2.5:1.5b"        # Used for intent classification + param extraction
-  synthesis_model: "llama3.2:3b"    # Used for answer synthesis + self-healing messages
+  synthesis_model: "qwen2.5:1.5b"    # Used for answer synthesis + self-healing messages
   ollama_base_url: "http://localhost:11434"
   intent_temperature: 0.0            # Zero — we want deterministic classification
   synthesis_temperature: 0.3         # Slight warmth for natural language output

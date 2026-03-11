@@ -206,21 +206,40 @@ def _run_graph_traversal(extraction) -> tuple:
     unique_entities = list(dict.fromkeys(entities))   # preserve order, dedupe
 
     # ── CRITICAL: Normalize entity order ─────────────────────
-    # The graph has two edges between Employee and Department:
-    #   Employee →works_in→    Department  (e.department_id = d.id)  ← ALL employees
-    #   Department →managed_by→ Employee   (d.manager_id = e.id)     ← ONE manager only
+    # Rules to prevent bad JOIN paths:
     #
-    # For ANY question about employees within a department
-    # (list, comparison, aggregation) we MUST anchor on Employee
-    # so the works_in edge is used, not managed_by.
-    # Force Employee before Department whenever both are present.
-    if "Employee" in unique_entities and "Department" in unique_entities:
-        # Rebuild with Employee first
-        reordered = ["Employee"]
-        for e in unique_entities:
-            if e != "Employee":
-                reordered.append(e)
-        unique_entities = reordered
+    # Rule 1 — Employee+Department: always anchor Employee first.
+    #   Employee →works_in→ Department uses e.department_id = d.id (ALL employees)
+    #   Department →managed_by→ Employee uses d.manager_id = e.id (ONE manager only)
+    #
+    # Rule 2 — Employee+Department+Project (3-entity):
+    #   The path Employee→Department→Project now works directly because
+    #   we added Department→Project (has_projects) edge to graph_schema.yaml.
+    #   Keep order as Employee→Department→Project so SQL is:
+    #     FROM employees e
+    #     JOIN departments d ON e.department_id = d.id
+    #     JOIN projects proj ON d.id = proj.department_id
+    #   This correctly filters employees in a dept working on dept projects.
+    #
+    #   EXCEPTION: if Department+Project are present but NO Employee, use
+    #   Employee→Project path and filter by department via WHERE.
+
+    entity_set = set(unique_entities)
+
+    if "Employee" in entity_set and "Department" in entity_set:
+        if "Project" in entity_set:
+            # 3-entity: Employee→Department→Project
+            unique_entities = ["Employee", "Department", "Project"]
+        else:
+            # 2-entity: Employee→Department
+            reordered = ["Employee"]
+            for e in unique_entities:
+                if e != "Employee":
+                    reordered.append(e)
+            unique_entities = reordered
+    elif "Employee" in entity_set and "Project" in entity_set and "Department" not in entity_set:
+        # Employee+Project only: Employee→Project direct path
+        unique_entities = ["Employee", "Project"]
 
     try:
         path = _graph.find_multi_path(unique_entities)

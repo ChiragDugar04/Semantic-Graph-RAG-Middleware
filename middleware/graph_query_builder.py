@@ -1,414 +1,275 @@
-"""
-middleware/graph_query_builder.py
-
-Converts a graph traversal path + entity extraction result into a
-valid, parameterized SQL query — packaged as a QueryTemplate.
-
-This is the "compiler" of the semantic graph system. It takes:
-  - EntityExtractionResult  → what entities, filters, question_type
-  - List[JoinStep]          → how to JOIN the tables (from semantic_graph)
-  - SemanticGraph           → node metadata (table names, aliases, columns)
-
-And produces a QueryTemplate that the existing query_executor.py
-can run without any changes. The rest of the pipeline (execution,
-formatting, synthesis) is completely unchanged.
-
-SQL Construction Rules:
-  - Single entity, no joins    → SELECT ... FROM table WHERE ...
-  - Two-hop, one join          → SELECT ... FROM t1 JOIN t2 ON ...
-  - Junction table (many-many) → SELECT ... FROM t1 JOIN junction JOIN t2
-  - question_type=comparison   → ORDER BY target_column DESC
-  - question_type=aggregation  → GROUP BY + COUNT/AVG
-  - question_type=list         → ORDER BY name ASC
-  - question_type=lookup       → LIMIT 10
-
-Security: ALL user values go through %(param)s placeholders.
-The LLM never writes SQL. This module writes SQL using graph metadata.
-"""
-
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from middleware.models import EntityExtractionResult, GraphTraversal, QueryTemplate
 from middleware.semantic_graph import SemanticGraph, JoinStep
 
+logger = logging.getLogger(__name__)
 
-# ============================================================
-# QUERY BUILDER
-# ============================================================
+
+class QueryBuildError(Exception):
+    pass
+
 
 class GraphQueryBuilder:
-    """Builds parameterized SQL from graph traversal metadata.
-
-    Instantiated once and reused. All state is passed per-call.
-    """
-
     def __init__(self, graph: SemanticGraph) -> None:
-        """
-        Args:
-            graph: The SemanticGraph instance (loaded once at startup).
-        """
         self._graph = graph
-
-    # ----------------------------------------------------------
-    # PUBLIC ENTRY POINT
-    # ----------------------------------------------------------
 
     def build_query(
         self,
         extraction: EntityExtractionResult,
         traversal: GraphTraversal,
         join_chain: List[JoinStep],
-    ) -> QueryTemplate:
-        """Build a complete QueryTemplate from graph traversal data.
+        effective_entities: Optional[List[str]] = None,
+    ) -> Tuple[QueryTemplate, Dict[str, Any]]:
+        entities = effective_entities if effective_entities else extraction.entities
+        filters = extraction.filters
+        q_type = extraction.question_type
+        path = traversal.path_taken
 
-        Args:
-            extraction : The EntityExtractionResult from entity_extractor.
-            traversal  : The GraphTraversal with path and metadata.
-            join_chain : Ordered list of JoinStep from semantic_graph.
+        if not path:
+            raise QueryBuildError("Cannot build query: traversal path is empty")
 
-        Returns:
-            QueryTemplate: Ready to pass to query_executor.execute_query().
-        """
-        entities    = extraction.entities
-        filters     = extraction.filters
-        q_type      = extraction.question_type
-        path        = traversal.path_taken
+        anchor = path[0]
+        joined_tables: Set[str] = self._get_joined_tables(path, join_chain)
 
-        # ── Determine anchor entity (primary FROM table) ──────
-        # Use the traversal PATH's first node, not extraction.entities[0].
-        # The pipeline normalizer may have reordered entities for correct
-        # JOIN direction (e.g. Employee→Department not Department→Employee)
-        # but extraction.entities still holds the original order.
-        # The path is always correctly ordered by the pipeline.
-        anchor = path[0] if path else (entities[0] if entities else "Employee")
-
-        # ── Build SELECT clause ───────────────────────────────
-        select_parts, params = self._build_select(
-            entities, filters, q_type, join_chain
-        )
-
-        # ── Build FROM clause ─────────────────────────────────
+        select_parts = self._build_select(entities, q_type, join_chain, extraction.projections, path)
         from_clause = self._build_from(anchor)
-
-        # ── Build JOIN clauses ────────────────────────────────
         join_clauses = self._build_joins(join_chain)
 
-        # ── Build WHERE clause ────────────────────────────────
-        where_clause, where_params = self._build_where(filters, entities)
-        params.update(where_params)
+        if "Project" in path:
+            mgr_join = "LEFT JOIN employees mgr ON mgr.id = proj.manager_id"
+            if mgr_join not in join_clauses:
+                join_clauses.append(mgr_join)
+            mgr_col = "mgr.name AS manager_name"
+            if mgr_col not in select_parts:
+                select_parts = [p for p in select_parts if "manager_id" not in p]
+                select_parts.append(mgr_col)
 
-        # ── Build ORDER BY + LIMIT ────────────────────────────
+        where_clause, where_params = self._build_where(filters, path, joined_tables)
         order_limit = self._build_order_limit(q_type, entities, filters)
 
-        # ── Assemble SQL ──────────────────────────────────────
-        sql_parts = [
-            f"SELECT {', '.join(select_parts)}",
-            from_clause,
-        ]
-        if join_clauses:
-            sql_parts.extend(join_clauses)
+        sql_parts = [f"SELECT {', '.join(select_parts)}", from_clause]
+        sql_parts.extend(join_clauses)
         if where_clause:
             sql_parts.append(f"WHERE {where_clause}")
         sql_parts.append(order_limit)
 
-        sql = "\n".join(sql_parts)
-
-        # ── Build description ─────────────────────────────────
+        sql = "\n".join(p for p in sql_parts if p.strip())
         description = self._build_description(entities, q_type, filters, path)
 
-        return QueryTemplate(
+        template = QueryTemplate(
             intent_name=f"graph:{'→'.join(path)}",
             description=description,
             sql_template=sql,
-            required_params=[],       # params already embedded safely
+            required_params=[],
             optional_params=[],
             result_description=description,
-        ), params
+        )
 
-    # ----------------------------------------------------------
-    # SELECT BUILDER
-    # ----------------------------------------------------------
+        logger.debug("Built query for path=%s type=%s filters=%s", path, q_type, list(filters.keys()))
+
+        return template, where_params
+
+    def _get_joined_tables(self, path: List[str], join_chain: List[JoinStep]) -> Set[str]:
+        tables = set(path)
+        for step in join_chain:
+            if step.junction_table:
+                tables.add(step.junction_table)
+        tables.add("employees_mgr") if "Project" in path else None
+        return tables
 
     def _build_select(
         self,
         entities: List[str],
-        filters: Dict[str, Any],
         q_type: str,
         join_chain: List[JoinStep],
-    ) -> Tuple[List[str], Dict[str, Any]]:
-        """Build SELECT column list.
-
-        For aggregation queries, wraps in COUNT/AVG.
-        For all others, collects meaningful columns from each entity.
-
-        Returns:
-            Tuple of (select_parts list, extra_params dict)
-        """
-        parts: List[str] = []
-        extra_params: Dict[str, Any] = {}
-
+        projections: Optional[List[str]],
+        path: List[str],
+    ) -> List[str]:
         if q_type == "aggregation":
-            # Count employees per department, etc.
-            if "Employee" in entities and "Department" in entities:
-                parts = [
-                    "d.name AS department_name",
-                    "COUNT(e.id) AS employee_count",
-                    "AVG(e.salary) AS avg_salary",
-                    "MAX(e.salary) AS max_salary",
-                    "MIN(e.salary) AS min_salary",
-                ]
-            elif "Employee" in entities and "Project" in entities:
-                parts = [
-                    "proj.name AS project_name",
-                    "COUNT(e.id) AS employee_count",
-                ]
-            elif "Employee" in entities:
-                parts = ["COUNT(e.id) AS employee_count"]
-            elif "Order" in entities:
-                parts = [
-                    "o.status",
-                    "COUNT(o.id) AS order_count",
-                    "SUM(o.quantity) AS total_quantity",
-                ]
-            else:
-                parts = ["COUNT(*) AS total_count"]
-            return parts, extra_params
+            return self._build_aggregation_select(entities)
 
-        # ── Non-aggregation: collect columns per entity ───────
-        seen_tables: set = set()
+        parts: List[str] = []
+        seen: Set[str] = set()
 
-        for entity in entities:
-            if entity in seen_tables:
+        for entity in path:
+            if entity in seen:
                 continue
-            seen_tables.add(entity)
+            seen.add(entity)
 
-            node      = self._graph.get_node_data(entity)
-            alias     = node["alias"]
-            sel_cols  = node.get("selectable_columns", [])
+            node = self._graph.get_node_data(entity)
+            alias = node["alias"]
 
-            for col_def in sel_cols:
-                col     = col_def["column"]
+            for col_def in node.get("selectable_columns", []):
+                col = col_def["column"]
                 col_alias = col_def["alias"]
-                parts.append(f"{alias}.{col} AS {col_alias}")
 
-        # ── Add junction table extras (e.g. assignment_role) ──
+                if col_def.get("is_hidden"):
+                    continue
+
+                if col_def.get("default_hidden"):
+                    requested = projections or []
+                    if col_alias not in requested and col not in requested:
+                        continue
+
+                if col_def.get("is_subquery"):
+                    parts.append(f"{col} AS {col_alias}")
+                else:
+                    parts.append(f"{alias}.{col} AS {col_alias}")
+
         for step in join_chain:
             for extra in step.extra_select:
                 if extra not in parts:
                     parts.append(extra)
 
-        # Fallback
-        if not parts:
-            parts = ["*"]
+        return parts if parts else ["*"]
 
-        return parts, extra_params
-
-    # ----------------------------------------------------------
-    # FROM BUILDER
-    # ----------------------------------------------------------
+    def _build_aggregation_select(self, entities: List[str]) -> List[str]:
+        if "Employee" in entities and "Department" in entities:
+            return [
+                "d.name AS department_name",
+                "COUNT(e.id) AS employee_count",
+                "AVG(e.salary) AS avg_salary",
+                "MAX(e.salary) AS max_salary",
+                "MIN(e.salary) AS min_salary",
+            ]
+        if "Employee" in entities and "Project" in entities:
+            return ["proj.name AS project_name", "COUNT(e.id) AS employee_count"]
+        if "Order" in entities:
+            return ["o.status", "COUNT(o.id) AS order_count", "SUM(o.quantity) AS total_quantity"]
+        if "Employee" in entities:
+            return ["COUNT(e.id) AS employee_count"]
+        return ["COUNT(*) AS total_count"]
 
     def _build_from(self, anchor_entity: str) -> str:
-        """Build the FROM clause using the anchor entity's table + alias.
-
-        Args:
-            anchor_entity: The primary entity (first in path).
-
-        Returns:
-            str: e.g. "FROM employees e"
-        """
-        node  = self._graph.get_node_data(anchor_entity)
-        table = node["table"]
-        alias = node["alias"]
-        return f"FROM {table} {alias}"
-
-    # ----------------------------------------------------------
-    # JOIN BUILDER
-    # ----------------------------------------------------------
+        node = self._graph.get_node_data(anchor_entity)
+        return f"FROM {node['table']} {node['alias']}"
 
     def _build_joins(self, join_chain: List[JoinStep]) -> List[str]:
-        """Build JOIN clauses from the ordered JoinStep list.
-
-        Handles:
-          - Simple FK joins: JOIN table alias ON condition
-          - Junction table joins: JOIN junction pa ON ..., JOIN target ON ...
-
-        Args:
-            join_chain: List of JoinStep from semantic_graph.get_join_chain().
-
-        Returns:
-            List[str]: One or more JOIN clause strings.
-        """
         joins: List[str] = []
-        joined_tables: set = set()
+        joined_tables: Set[str] = set()
 
         for step in join_chain:
-            to_node = step.to_node
-            node    = self._graph.get_node_data(to_node)
-            table   = node["table"]
-            alias   = node["alias"]
-            j_type  = step.join_type
+            node = self._graph.get_node_data(step.to_node)
+            table = node["table"]
+            alias = node["alias"]
+            j_type = step.join_type
 
             if step.junction_table:
-                # Many-to-many: two JOIN clauses
-                jt     = step.junction_table
+                jt = step.junction_table
                 jalias = step.junction_alias or jt[:2]
+                conditions = [c.strip() for c in step.join_condition.split(" AND ")]
 
-                # Parse the compound condition: "e.id = pa.employee_id AND pa.project_id = proj.id"
-                # Split into two parts
-                conditions = step.join_condition.split(" AND ")
                 if len(conditions) == 2:
-                    cond1 = conditions[0].strip()   # e.id = pa.employee_id
-                    cond2 = conditions[1].strip()   # pa.project_id = proj.id
+                    cond1, cond2 = conditions
                 else:
                     cond1 = step.join_condition
-                    cond2 = f"{jalias}.{to_node.lower()}_id = {alias}.id"
+                    cond2 = f"{jalias}.{step.to_node.lower()}_id = {alias}.id"
 
-                # JOIN junction table
                 if jt not in joined_tables:
                     joins.append(f"{j_type} JOIN {jt} {jalias} ON {cond1}")
                     joined_tables.add(jt)
 
-                # JOIN target table
                 if table not in joined_tables:
                     joins.append(f"{j_type} JOIN {table} {alias} ON {cond2}")
                     joined_tables.add(table)
-
             else:
-                # Simple FK join
                 if table not in joined_tables:
-                    joins.append(
-                        f"{j_type} JOIN {table} {alias} ON {step.join_condition}"
-                    )
+                    joins.append(f"{j_type} JOIN {table} {alias} ON {step.join_condition}")
                     joined_tables.add(table)
 
         return joins
 
-    # ----------------------------------------------------------
-    # WHERE BUILDER
-    # ----------------------------------------------------------
-
     def _build_where(
         self,
         filters: Dict[str, Any],
-        entities: List[str],
+        path: List[str],
+        joined_tables: Set[str],
     ) -> Tuple[str, Dict[str, Any]]:
-        """Build a parameterized WHERE clause from filters.
-
-        Maps filter keys to SQL columns using the graph's
-        filterable_columns metadata. Uses LIKE for name fields
-        and = for exact match fields (status, category).
-
-        Args:
-            filters : Filter key → value dict from extraction.
-            entities: Entities involved (to know which alias to use).
-
-        Returns:
-            Tuple of (where_string, params_dict).
-            where_string is empty if no filters apply.
-        """
         conditions: List[str] = []
         params: Dict[str, Any] = {}
 
-        # Map from filter key → (sql_column, match_type)
-        filter_map: Dict[str, Tuple[str, str]] = {}
-
-        for entity in entities:
-            try:
-                filterable = self._graph.get_filterable_columns(entity)
-                for col_key, col_meta in filterable.items():
-                    filter_map[col_key] = (
-                        col_meta["sql_column"],
-                        col_meta["match_type"],
-                    )
-            except Exception:
-                continue
-
-        # Also add known filter key aliases
-        # IMPORTANT: The alias maps to the BASE column key (not the filter key)
-        # so that query_executor._EXACT_MATCH_PARAMS {"status","category"} fires
-        # correctly and does NOT wrap these values in % wildcards.
-        _FILTER_KEY_ALIASES = {
-            "employee_name":   "name",
-            "department_name": "name",
-            "product_name":    "name",
-            "project_name":    "name",
-            "order_status":    "status",    # resolves to exact-match "status"
-            "project_status":  "status",    # resolves to exact-match "status"
-            "employee_role":   "role",
-        }
-
-        # Keys that must use exact match (= not LIKE) regardless of graph metadata.
-        # Mirrors query_executor._EXACT_MATCH_PARAMS so param names align.
-        _FORCE_EXACT_KEYS = {"status", "category"}
-
-        # Build a DIRECT filter_key → (sql_column, match_type) map
-        # that respects which entity each filter_key belongs to.
-        # This avoids the collision where both Employee.name and
-        # Department.name resolve to the same base key "name".
-        _DIRECT_FILTER_MAP: Dict[str, tuple] = {
-            "employee_name":   ("e.name",    "like"),
-            "department_name": ("d.name",    "like"),
-            "product_name":    ("p.name",    "like"),
-            "project_name":    ("proj.name", "like"),
-            "order_status":    ("o.status",  "exact"),
-            "project_status":  ("proj.status", "exact"),
-            "employee_role":   ("e.role",    "like"),
-            "category":        ("p.category","exact"),
-            "manager_name":    ("proj.manager_id", "subquery"),  # special: subquery
-        }
+        has_employees = "Employee" in path
+        has_departments = "Department" in path
+        has_projects = "Project" in path
+        has_products = "Product" in path
+        has_orders = "Order" in path
 
         for filter_key, filter_value in filters.items():
             if not filter_value:
                 continue
 
-            # Try direct map first — this is unambiguous
-            if filter_key in _DIRECT_FILTER_MAP:
-                sql_col, match_type = _DIRECT_FILTER_MAP[filter_key]
-            else:
-                # Fall back to graph filter_map via alias resolution
-                resolved_key = _FILTER_KEY_ALIASES.get(filter_key, filter_key)
-                sql_col    = None
-                match_type = "like"
+            filter_value = str(filter_value)
 
-                if resolved_key in filter_map:
-                    sql_col, match_type = filter_map[resolved_key]
-                elif filter_key in filter_map:
-                    sql_col, match_type = filter_map[filter_key]
+            if filter_key == "employee_name" and has_employees:
+                conditions.append("e.name LIKE %(employee_name)s")
+                params["employee_name"] = f"%{filter_value}%"
 
-                if sql_col is None:
-                    continue
+            elif filter_key == "employee_role" and has_employees:
+                conditions.append("e.role LIKE %(employee_role)s")
+                params["employee_role"] = f"%{filter_value}%"
 
-            # Force exact match for status/category fields
-            resolved_key = _FILTER_KEY_ALIASES.get(filter_key, filter_key)
-            if resolved_key in _FORCE_EXACT_KEYS:
-                match_type = "exact"
+            elif filter_key == "department_name":
+                if has_departments:
+                    conditions.append("d.name LIKE %(department_name)s")
+                    params["department_name"] = f"%{filter_value}%"
+                elif has_employees:
+                    conditions.append(
+                        "e.department_id IN "
+                        "(SELECT id FROM departments WHERE name LIKE %(department_name)s)"
+                    )
+                    params["department_name"] = f"%{filter_value}%"
+                else:
+                    logger.warning(
+                        "Filter 'department_name' cannot be applied: "
+                        "neither Department nor Employee in path %s", path
+                    )
 
-            # Use resolved key as SQL param name so executor's
-            # _EXACT_MATCH_PARAMS guard fires correctly for "status"/"category"
-            safe_param = re.sub(r"[^a-z0-9_]", "_", resolved_key.lower())
+            elif filter_key == "project_name" and has_projects:
+                conditions.append("proj.name LIKE %(project_name)s")
+                params["project_name"] = f"%{filter_value}%"
 
-            if match_type == "subquery":
-                # manager_name → proj.manager_id IN (SELECT id FROM employees WHERE name LIKE ...)
+            elif filter_key == "project_status" and has_projects:
+                conditions.append("proj.status = %(project_status)s")
+                params["project_status"] = filter_value
+
+            elif filter_key == "project_department" and has_projects:
                 conditions.append(
-                    f"proj.manager_id IN "
-                    f"(SELECT id FROM employees WHERE name LIKE %({safe_param})s)"
+                    "proj.department_id IN "
+                    "(SELECT id FROM departments WHERE name LIKE %(project_department)s)"
                 )
-                params[safe_param] = f"%{filter_value}%"
-            elif match_type == "like":
-                conditions.append(f"{sql_col} LIKE %({safe_param})s")
-                params[safe_param] = filter_value   # raw value — executor wraps with %
+                params["project_department"] = f"%{filter_value}%"
+
+            elif filter_key == "manager_name" and has_projects:
+                conditions.append(
+                    "proj.manager_id IN "
+                    "(SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
+                )
+                params["manager_name"] = f"%{filter_value}%"
+
+            elif filter_key == "product_name" and has_products:
+                conditions.append("p.name LIKE %(product_name)s")
+                params["product_name"] = f"%{filter_value}%"
+
+            elif filter_key == "category" and has_products:
+                conditions.append("p.category = %(category)s")
+                params["category"] = filter_value
+
+            elif filter_key == "order_status" and has_orders:
+                conditions.append("o.status = %(order_status)s")
+                params["order_status"] = filter_value
+
             else:
-                conditions.append(f"{sql_col} = %({safe_param})s")
-                params[safe_param] = filter_value
+                logger.debug(
+                    "Filter key '%s' skipped — no matching table in path %s",
+                    filter_key, path
+                )
 
         return " AND ".join(conditions), params
-
-    # ----------------------------------------------------------
-    # ORDER BY + LIMIT BUILDER
-    # ----------------------------------------------------------
 
     def _build_order_limit(
         self,
@@ -416,22 +277,12 @@ class GraphQueryBuilder:
         entities: List[str],
         filters: Dict[str, Any],
     ) -> str:
-        """Build ORDER BY and LIMIT clauses based on question type.
-
-        Args:
-            q_type  : Question type string.
-            entities: Entities involved.
-            filters : Applied filters (used to detect salary context).
-
-        Returns:
-            str: ORDER BY / GROUP BY / LIMIT clause(s).
-        """
         if q_type == "comparison":
-            # Detect what we're comparing
             if "Employee" in entities:
-                if any(k in filters for k in ["department_name", "project_name"]):
-                    return "ORDER BY e.salary DESC"
-                return "ORDER BY e.salary DESC LIMIT 10"
+                has_scope_filter = any(
+                    k in filters for k in ["department_name", "project_name", "manager_name"]
+                )
+                return "ORDER BY e.salary DESC" if has_scope_filter else "ORDER BY e.salary DESC LIMIT 10"
             if "Product" in entities:
                 return "ORDER BY p.price DESC LIMIT 10"
             return "ORDER BY 1 DESC LIMIT 10"
@@ -452,6 +303,8 @@ class GraphQueryBuilder:
                 return "ORDER BY p.name ASC"
             if "Order" in entities:
                 return "ORDER BY o.order_date DESC LIMIT 20"
+            if "Project" in entities:
+                return "ORDER BY proj.name ASC"
             return "ORDER BY 1 ASC"
 
         if q_type == "cross_entity":
@@ -459,12 +312,7 @@ class GraphQueryBuilder:
                 return "ORDER BY e.name ASC"
             return "ORDER BY 1 ASC"
 
-        # Default: lookup
         return "LIMIT 10"
-
-    # ----------------------------------------------------------
-    # DESCRIPTION BUILDER
-    # ----------------------------------------------------------
 
     def _build_description(
         self,
@@ -473,35 +321,19 @@ class GraphQueryBuilder:
         filters: Dict[str, Any],
         path: List[str],
     ) -> str:
-        """Generate a human-readable description of the query.
-
-        Used in the Glass Box audit trail.
-
-        Args:
-            entities: Entity names involved.
-            q_type  : Question type.
-            filters : Applied filters.
-            path    : Graph traversal path.
-
-        Returns:
-            str: Description for Glass Box display.
-        """
-        path_str = " → ".join(path)
-        filter_str = ", ".join(
-            f"{k}={v}" for k, v in filters.items() if v
-        )
-
         type_labels = {
-            "lookup":       "Lookup",
-            "list":         "List all",
-            "comparison":   "Compare/Rank",
-            "aggregation":  "Aggregate",
+            "lookup": "Lookup",
+            "list": "List all",
+            "comparison": "Compare/Rank",
+            "aggregation": "Aggregate",
             "cross_entity": "Cross-entity join",
-            "other":        "Unknown",
+            "other": "Unknown",
         }
 
         label = type_labels.get(q_type, q_type)
         entity_str = " + ".join(entities)
+        filter_str = ", ".join(f"{k}={v}" for k, v in filters.items() if v)
+        path_str = " → ".join(path)
 
         desc = f"{label}: {entity_str}"
         if filter_str:

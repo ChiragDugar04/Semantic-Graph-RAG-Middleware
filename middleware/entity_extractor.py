@@ -1,567 +1,674 @@
-"""
-middleware/entity_extractor.py
-
-Replaces intent_classifier.py + param_extractor.py in the new pipeline.
-
-Instead of classifying into a named intent, this module identifies:
-  - Which database ENTITIES the question involves (Employee, Department, etc.)
-  - What FILTERS to apply (name="Sarah", department="Engineering")
-  - What PROJECTIONS the user wants (salary, role, budget, etc.)
-  - What QUESTION TYPE it is (lookup / list / comparison / aggregation / cross_entity)
-
-Two-tier approach (same philosophy as the old system):
-  Tier 1 — Rule-based fast path (zero LLM cost, instant)
-  Tier 2 — LLM extraction using qwen2.5:1.5b with structured JSON output
-
-The output EntityExtractionResult feeds directly into:
-  semantic_graph.py  → to find the JOIN path
-  graph_query_builder.py → to construct the SQL
-"""
-
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
-import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
+import spacy
 import yaml
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from middleware.models import EntityExtractionResult, ExtractionConfidence
 
-from middleware.models import EntityExtractionResult
+logger = logging.getLogger(__name__)
+
+_nlp: Optional[spacy.language.Language] = None
+_schema_cache: Optional[Dict[str, Any]] = None
 
 
-# ============================================================
-# CONFIG LOADER
-# ============================================================
+def _load_nlp() -> spacy.language.Language:
+    global _nlp
+    if _nlp is None:
+        try:
+            _nlp = spacy.load("en_core_web_sm")
+            logger.info("spaCy model en_core_web_sm loaded")
+        except OSError:
+            logger.warning("spaCy model not found — running without dependency parsing")
+            _nlp = None
+    return _nlp
+
 
 def _load_model_config() -> dict:
-    """Load model settings from intents.yaml (reused from old system)."""
     config_path = Path(__file__).parent.parent / "config" / "intents.yaml"
     with open(config_path, "r") as f:
         return yaml.safe_load(f)["models"]
 
 
-# ============================================================
-# NORMALIZATION (same as old intent_classifier)
-# ============================================================
-
-def _normalize(text: str) -> str:
-    """Lowercase and normalize Unicode punctuation."""
-    return (
-        text
-        .replace("\u2019", "'").replace("\u2018", "'")
-        .replace("\u201c", '"').replace("\u201d", '"')
-        .replace("\u2014", "-").replace("\u2013", "-")
-        .lower().strip()
-    )
+def _load_schema() -> Dict[str, Any]:
+    global _schema_cache
+    if _schema_cache is None:
+        schema_path = Path(__file__).parent.parent / "config" / "graph_schema.yaml"
+        with open(schema_path, "r") as f:
+            _schema_cache = yaml.safe_load(f)
+    return _schema_cache
 
 
-# ============================================================
-# KNOWN VOCABULARY — for rule-based tier
-# ============================================================
+def _get_valid_entities() -> List[str]:
+    return list(_load_schema()["nodes"].keys())
 
-# Exact employee names from seed data (lowercase)
-_KNOWN_EMPLOYEES = [
-    "sarah connor", "john reese", "alan turing", "grace hopper",
-    "linus torvalds", "michael scott", "jim halpert", "dwight schrute",
-    "pam beesly", "toby flenderson", "kelly kapoor", "don draper",
-    "peggy olson", "roger sterling", "leslie knope", "ben wyatt",
-    "tom haverford",
+
+def _get_schema_keywords() -> Dict[str, Any]:
+    schema = _load_schema()
+    keywords: Dict[str, Any] = {
+        "entity_triggers": {},
+        "filter_column_labels": {},
+        "projection_labels": {},
+    }
+
+    entity_trigger_map = {
+        "Employee": ["employee", "employees", "staff", "worker", "workers", "person", "people", "who", "member"],
+        "Department": ["department", "departments", "dept", "team", "division", "group"],
+        "Product": ["product", "products", "item", "items", "stock", "inventory", "unit", "units"],
+        "Order": ["order", "orders", "purchase", "purchases", "bought", "ordered"],
+        "Project": ["project", "projects", "initiative", "initiatives", "program", "programs"],
+    }
+
+    for entity, node_data in schema["nodes"].items():
+        triggers = entity_trigger_map.get(entity, [entity.lower()])
+        keywords["entity_triggers"][entity] = triggers
+
+        for col_def in node_data.get("selectable_columns", []):
+            label = col_def.get("label", "").lower()
+            alias = col_def.get("alias", "")
+            col = col_def.get("column", "")
+            if label:
+                keywords["projection_labels"][label] = alias
+            if alias:
+                keywords["projection_labels"][alias] = alias
+            if col:
+                keywords["projection_labels"][col] = alias
+
+    return keywords
+
+
+_QUESTION_TYPE_PATTERNS = [
+    (re.compile(r"\b(how many|count of|number of|total number)\b", re.I), "aggregation"),
+    (re.compile(r"\b(average|avg|mean|sum|total)\b", re.I), "aggregation"),
+    (re.compile(r"\b(highest|lowest|most|least|top|best|worst|maximum|minimum|richest|cheapest|priciest|most expensive)\b", re.I), "comparison"),
+    (re.compile(r"\b(who earns|who makes|who gets paid|highest paid|lowest paid|best paid)\b", re.I), "comparison"),
+    (re.compile(r"\b(list|show|all|every|display|give me all)\b", re.I), "list"),
+    (re.compile(r"\b(what is|what are|tell me|find|get|show me the|which is|who is)\b", re.I), "lookup"),
 ]
 
-# Exact department names from seed data (lowercase)
-_KNOWN_DEPARTMENTS = [
-    "engineering", "sales", "human resources", "hr", "marketing", "operations",
-]
+_OFF_TOPIC_PATTERNS = re.compile(
+    r"\b(weather|joke|news|sports|stock market|recipe|movie|song|capital of|"
+    r"population of|how to cook|translate|what time|current time|define |meaning of)\b",
+    re.I,
+)
 
-# Exact project names from seed data (lowercase)
-_KNOWN_PROJECTS = [
-    "api gateway rebuild", "platform migration", "q1 marketing campaign",
-    "hr system upgrade", "ops automation initiative", "sales crm integration",
-]
+_MANAGER_PATTERNS = re.compile(
+    r"\b(managed by|manages|manager of|who manages|who leads|who runs|led by|run by|head of|in charge of)\b",
+    re.I,
+)
 
-# Known product names (lowercase)
-_KNOWN_PRODUCTS = [
-    "laptop pro 15", "wireless mouse", "standing desk", "ergonomic chair",
-    "usb-c hub", "mechanical keyboard", "monitor 27 inch", "whiteboard 4x6",
-    "notebook pack", "webcam hd", "desk lamp", "printer paper a4",
-]
+_ASSIGNMENT_PATTERNS = re.compile(
+    r"\b(assigned to|working on|works on|on the|member of|part of|involved in|participating in)\b",
+    re.I,
+)
 
-# Known product categories
-_KNOWN_CATEGORIES = [
-    "electronics", "furniture", "office supply", "office supplies",
-]
-
-# Keywords that signal each question type
-_COMPARISON_KEYWORDS = [
-    "highest", "lowest", "most", "least", "best", "worst", "top",
-    "maximum", "minimum", "richest", "rank", "ranked", "ranking",
-    "who earns", "who makes", "who gets paid", "highest paid",
-    "lowest paid", "most expensive", "cheapest",
-]
-
-_AGGREGATION_KEYWORDS = [
-    "how many", "count", "total", "average", "avg", "sum",
-    "number of", "how much total", "overall",
-]
-
-_LIST_KEYWORDS = [
-    "list", "show", "all", "every", "which employees", "who works",
-    "who is in", "members of", "give me all", "show me all",
-    "what are all",
-]
-
-_ORDER_KEYWORDS = [
-    "order", "orders", "purchase", "purchases", "bought", "ordered",
-]
-
-_ORDER_STATUS_SYNONYMS = {
-    "not completed": "pending", "not complete": "pending",
-    "in progress": "processing", "in-progress": "processing",
-    "in transit": "shipped", "in-transit": "shipped",
-    "on the way": "shipped", "out for delivery": "shipped",
-    "completed": "delivered", "done": "delivered",
-    "canceled": "cancelled", "called off": "cancelled",
+_STATUS_MAP = {
+    "pending": "pending",
+    "processing": "processing",
+    "shipped": "shipped",
+    "delivered": "delivered",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "active": "active",
+    "completed": "completed",
+    "complete": "completed",
+    "planning": "planning",
+    "planned": "planning",
+    "on hold": "on_hold",
+    "on_hold": "on_hold",
+    "paused": "on_hold",
 }
 
-_KNOWN_ORDER_STATUSES = [
-    "pending", "processing", "shipped", "delivered", "cancelled",
-]
+_CATEGORY_MAP = {
+    "electronics": "Electronics",
+    "electronic": "Electronics",
+    "furniture": "Furniture",
+    "office supply": "Office Supply",
+    "office supplies": "Office Supply",
+    "supply": "Office Supply",
+    "supplies": "Office Supply",
+}
+
+_PROJECTION_KEYWORDS = {
+    "salary": "salary",
+    "salaries": "salary",
+    "pay": "salary",
+    "earnings": "salary",
+    "compensation": "salary",
+    "earn": "salary",
+    "makes": "salary",
+    "budget": "budget",
+    "stock": "stock_quantity",
+    "inventory": "stock_quantity",
+    "units": "stock_quantity",
+    "price": "price",
+    "cost": "price",
+    "location": "location",
+    "email": "email",
+    "role": "role",
+    "hire date": "hire_date",
+    "hired": "hire_date",
+    "headcount": "headcount",
+    "manager": "manager_name",
+    "manages": "manager_name",
+    "managed by": "manager_name",
+    "status": "status",
+    "description": "description",
+}
 
 
-# ============================================================
-# TIER 1 — RULE-BASED EXTRACTION
-# ============================================================
+def _compute_confidence(
+    entities: List[str],
+    filters: Dict[str, Any],
+    question_type: str,
+    has_clear_structure: bool,
+    projections: List[str],
+    extraction_layer: str,
+) -> Tuple[float, Dict[str, float]]:
+    breakdown: Dict[str, float] = {}
 
-def _rule_based_extraction(question: str) -> Optional[EntityExtractionResult]:
-    """Fast-path extraction using deterministic string matching.
+    entity_score = 0.3 if entities else 0.0
+    breakdown["entity_recognized"] = entity_score
 
-    Handles single-entity questions and common patterns without
-    calling the LLM. Returns None if rules don't confidently match,
-    triggering Tier 2 LLM extraction.
+    filter_score = 0.2 if filters else 0.0
+    breakdown["filter_extracted"] = filter_score
 
-    Args:
-        question: Raw user question.
+    type_score = 0.2 if question_type != "lookup" else 0.1
+    breakdown["question_type_resolved"] = type_score
 
-    Returns:
-        EntityExtractionResult if rules matched, else None.
-    """
-    q = _normalize(question)
-    entities: List[str] = []
-    filters: Dict[str, Any] = {}
-    projections: List[str] = []
-    question_type = "lookup"
+    structure_score = 0.15 if has_clear_structure else 0.0
+    breakdown["grammatical_structure_clear"] = structure_score
 
-    # ── FIX 1: Detect "employee/employees" word FIRST ────────
-    # Before any entity matching, check if the question is talking
-    # about employees generically (e.g. "which employees in Engineering")
-    # so Employee is always added even without a specific name.
-    _EMPLOYEE_SUBJECT_PHRASES = [
-        "employees", "employee", "who works", "who is in", "who are in",
-        "which employees", "staff", "team members", "people in",
-        "workers", "assigned to", "working on", "members of",
+    projection_score = 0.15 if projections else 0.0
+    breakdown["projections_identified"] = projection_score
+
+    if extraction_layer == "pattern":
+        breakdown["layer_bonus"] = 0.1
+    elif extraction_layer == "spacy":
+        breakdown["layer_bonus"] = 0.05
+    else:
+        breakdown["layer_bonus"] = 0.0
+
+    total = min(1.0, sum(breakdown.values()))
+    return total, breakdown
+
+
+def _extract_filter_value_for_entity(
+    question: str,
+    entity: str,
+) -> Optional[str]:
+    schema = _load_schema()
+    node_data = schema["nodes"].get(entity, {})
+    filterable = node_data.get("filterable_columns", {})
+
+    name_patterns = [
+        r"\b(?:in|for|of|about|called|named|the)\s+([A-Z][a-zA-Z\s&\-]+?)(?:\s+(?:department|dept|team|project|product|employee|staff))?\b",
+        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+(?:department|dept|team|project|product)",
     ]
-    employee_subject_detected = any(phrase in q for phrase in _EMPLOYEE_SUBJECT_PHRASES)
-    if employee_subject_detected:
-        entities.append("Employee")
 
-    # ── Detect "managed by X" BEFORE employee name ───────────
-    # For queries like "projects managed by Sarah" or "employees
-    # working on projects managed by Don", the named person is the
-    # PROJECT MANAGER, not an employee being listed. Store separately
-    # so the query builder can build a subquery instead of filtering
-    # the listed employees by name.
-    import re as _re
-    _managed_by_match = _re.search(
-        r"managed by\s+([a-z]+(?:\s+[a-z]+)?)", q
+    if "name" in filterable:
+        for pattern in name_patterns:
+            match = re.search(pattern, question)
+            if match:
+                value = match.group(1).strip()
+                if len(value) > 1 and value.lower() not in {
+                    "all", "every", "any", "the", "a", "an", "list", "show",
+                    "what", "who", "which", "how", "where", "when", "why"
+                }:
+                    return value
+
+    return None
+
+
+def _extract_named_values(question: str) -> Dict[str, Any]:
+    filters: Dict[str, Any] = {}
+
+    for status_word, status_val in _STATUS_MAP.items():
+        if re.search(rf"\b{re.escape(status_word)}\b", question, re.I):
+            if any(w in question.lower() for w in ["order", "orders", "purchase"]):
+                filters["order_status"] = status_val
+            elif any(w in question.lower() for w in ["project", "projects", "initiative"]):
+                filters["project_status"] = status_val
+            break
+
+    for cat_word, cat_val in _CATEGORY_MAP.items():
+        if re.search(rf"\b{re.escape(cat_word)}\b", question, re.I):
+            filters["category"] = cat_val
+            break
+
+    manager_match = _MANAGER_PATTERNS.search(question)
+    if manager_match:
+        after_manager = question[manager_match.end():].strip()
+        name_match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", after_manager)
+        if name_match:
+            filters["manager_name"] = name_match.group(1).strip()
+
+    name_in_dept = re.search(
+        r"\b(?:in|from|of|within)\s+(?:the\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+(?:department|dept|team|division))?\s*(?:$|\?|,)",
+        question, re.I
     )
-    matched_manager: Optional[str] = None
-    if _managed_by_match:
-        candidate = _managed_by_match.group(1).strip()
-        # Confirm it's a known employee name
-        for emp in sorted(_KNOWN_EMPLOYEES, key=len, reverse=True):
-            if emp.startswith(candidate) or candidate in emp:
-                matched_manager = emp
-                filters["manager_name"] = emp.title()
-                if "Project" not in entities:
-                    entities.append("Project")
-                break
+    if name_in_dept:
+        candidate = name_in_dept.group(1).strip()
+        if candidate.lower() not in {"all", "every", "each", "the"}:
+            if not any(w in candidate.lower() for w in ["project", "order", "product"]):
+                filters["department_name"] = candidate
 
-    # ── Detect employee name ──────────────────────────────────
-    matched_employee: Optional[str] = None
-    for emp in sorted(_KNOWN_EMPLOYEES, key=len, reverse=True):
-        if emp in q:
-            # Skip — this name is already captured as manager_name
-            if matched_manager and emp == matched_manager:
-                continue
-            matched_employee = emp
-            if "Employee" not in entities:
-                entities.append("Employee")
-            # Reconstruct title-cased name
-            filters["employee_name"] = emp.title()
-            break
-
-    # ── Detect department name ────────────────────────────────
-    matched_dept: Optional[str] = None
-    for dept in sorted(_KNOWN_DEPARTMENTS, key=len, reverse=True):
-        if dept in q:
-            matched_dept = dept
-            if "Department" not in entities:
-                entities.append("Department")
-            # Normalize HR
-            dept_value = "Human Resources" if dept == "hr" else dept.title()
-            filters["department_name"] = dept_value
-            break
-
-    # ── Detect project name ───────────────────────────────────
-    for proj in sorted(_KNOWN_PROJECTS, key=len, reverse=True):
-        if proj in q:
-            if "Project" not in entities:
-                entities.append("Project")
-            filters["project_name"] = proj.title()
-            break
-
-    # ── FIX 2: Detect "project/projects" word generically ────
-    # "working on projects", "assigned to projects" etc.
-    _PROJECT_SUBJECT_PHRASES = ["projects", "project managed", "project led"]
-    if any(phrase in q for phrase in _PROJECT_SUBJECT_PHRASES):
-        if "Project" not in entities:
-            entities.append("Project")
-
-    # ── Detect product name ───────────────────────────────────
-    for prod in sorted(_KNOWN_PRODUCTS, key=len, reverse=True):
-        if prod in q:
-            if "Product" not in entities:
-                entities.append("Product")
-            filters["product_name"] = prod.title()
-            break
-
-    # ── Detect product category ───────────────────────────────
-    for cat in _KNOWN_CATEGORIES:
-        if cat in q:
-            if "Product" not in entities:
-                entities.append("Product")
-            # Normalize "office supplies" → "Office Supply"
-            cat_value = "Office Supply" if "office suppl" in cat else cat.title()
-            filters["category"] = cat_value
-            break
-
-    # ── FIX 3: Detect "product" word generically ─────────────
-    # "most expensive product", "which product" etc.
-    if "product" in q or "products" in q or "item" in q:
-        if "Product" not in entities:
-            entities.append("Product")
-
-    # ── Detect order status ───────────────────────────────────
-    order_status: Optional[str] = None
-    for synonym, canonical in sorted(
-        _ORDER_STATUS_SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True
-    ):
-        if synonym in q:
-            order_status = canonical
-            break
-    if order_status is None:
-        for status in _KNOWN_ORDER_STATUSES:
-            if status in q:
-                order_status = status
-                break
-
-    if order_status or any(kw in q for kw in _ORDER_KEYWORDS):
-        if "Order" not in entities:
-            entities.append("Order")
-        if order_status:
-            filters["order_status"] = order_status
-
-
-    # ── Detect project status ────────────────────────────────
-    _PROJECT_STATUS_MAP = {
-        "in progress": "active", "ongoing": "active", "current": "active",
-        "active": "active", "completed": "completed", "finished": "completed",
-        "planned": "planned", "upcoming": "planned",
-    }
-    for _pkw, _pval in sorted(_PROJECT_STATUS_MAP.items(), key=lambda x: len(x[0]), reverse=True):
-        if _pkw in q and "Project" in entities:
-            filters["project_status"] = _pval
-            break
-
-    # ── Detect question type ──────────────────────────────────
-    # FIX 4: Check aggregation first, then comparison (longest phrases first)
-    for kw in _AGGREGATION_KEYWORDS:
-        if kw in q:
-            question_type = "aggregation"
-            break
-
-    if question_type == "lookup":
-        # Check comparison keywords sorted longest-first to avoid
-        # "most" matching before "most expensive"
-        for kw in sorted(_COMPARISON_KEYWORDS, key=len, reverse=True):
-            if kw in q:
-                question_type = "comparison"
-                break
-
-    if question_type == "lookup":
-        for kw in _LIST_KEYWORDS:
-            if kw in q:
-                question_type = "list"
-                break
-
-    # ── Detect projections from question ─────────────────────
-    if "salary" in q or "earn" in q or "pay" in q or "compensation" in q:
-        projections.append("salary")
-    if "budget" in q:
-        projections.append("budget")
-    if "role" in q or "position" in q or "title" in q:
-        projections.append("role")
-    if "stock" in q or "inventory" in q or "units" in q or "quantity" in q:
-        projections.append("stock_quantity")
-    if "price" in q or "cost" in q or "expensive" in q:
-        projections.append("price")
-
-    # ── FIX 5: Cross-entity detection + entity promotion ─────
-    entity_set = set(entities)
-
-    # CRITICAL: If question is a comparison/list involving a Department,
-    # the user almost always wants EMPLOYEE data within that department
-    # (e.g. "who earns the most in Marketing?" → needs Employee + Department).
-    # Promote Employee into entities so the JOIN is built correctly.
-    if "Department" in entity_set and "Employee" not in entity_set:
-        if question_type in ("comparison", "list", "aggregation"):
-            # Salary/role comparisons within a dept require Employee rows
-            if any(kw in q for kw in ["earn", "salary", "paid", "pay",
-                                       "earns", "makes", "compensation",
-                                       "who", "list", "show", "employees"]):
-                entities.append("Employee")
-                entity_set.add("Employee")
-
-    # Employee + Department → cross_entity when both specifically named
-    if "Employee" in entity_set and "Department" in entity_set:
-        if matched_employee and matched_dept:
-            # Both a specific person AND a dept → truly cross-entity
-            question_type = "cross_entity"
-        # Otherwise keep list/comparison — it's "employees IN dept" pattern
-
-    # Employee + Project → always cross_entity
-    if "Employee" in entity_set and "Project" in entity_set:
-        question_type = "cross_entity"
-
-    # Department + Project → cross_entity
-    if "Department" in entity_set and "Project" in entity_set:
-        question_type = "cross_entity"
-
-    # 3+ entities → always cross_entity
-    if len(entity_set) >= 3:
-        question_type = "cross_entity"
-
-    # ── Decide: return rules result or fall through to LLM ───
-    if not entities:
-        # No entities detected by rules — must use LLM
-        return None
-
-    # Rules confidently matched at least one entity
-    return EntityExtractionResult(
-        entities=entities,
-        filters=filters,
-        projections=projections,
-        question_type=question_type,
-        extraction_method="rules",
-        latency_ms=0.0,
+    project_name_match = re.search(
+        r"\b(?:project|initiative|program)\s+(?:called\s+|named\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+project)?\s*(?:$|\?|,|\.|and)",
+        question, re.I
     )
+    if project_name_match:
+        candidate = project_name_match.group(1).strip()
+        if len(candidate) > 2:
+            filters["project_name"] = candidate
 
+    product_name_match = re.search(
+        r"\b(?:product\s+)?([A-Z][a-zA-Z\s]+\s+(?:Pro|HD|Hub|Desk|Chair|Keyboard|Monitor|Mouse|Lamp|Pack|Paper|Whiteboard)[\w\s]*)\b",
+        question
+    )
+    if product_name_match:
+        filters["product_name"] = product_name_match.group(1).strip()
 
-# ============================================================
-# TIER 2 — LLM EXTRACTION
-# ============================================================
+    person_name_match = re.search(
+        r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\'s)?\s+(?:salary|pay|role|email|department|budget|project|assigned)",
+        question
+    )
+    if person_name_match:
+        filters["employee_name"] = person_name_match.group(1).strip()
 
-def _llm_extraction(question: str) -> EntityExtractionResult:
-    """Use qwen2.5:1.5b to extract entities, filters, and question type.
-
-    Sends a carefully structured prompt that instructs the LLM to
-    return ONLY a JSON object with no prose. Parses the response
-    and falls back to a safe default on any error.
-
-    Args:
-        question: Raw user question.
-
-    Returns:
-        EntityExtractionResult populated from LLM output.
-    """
-    model_cfg = _load_model_config()
-    fast_model: str    = model_cfg["fast_model"]
-    base_url: str      = model_cfg["ollama_base_url"]
-    temperature: float = model_cfg["intent_temperature"]
-
-    prompt = f"""You are a database entity extractor. Analyze the user question and return a JSON object.
-
-AVAILABLE ENTITIES:
-- Employee   (table: employees)   fields: name, role, salary, hire_date, email
-- Department (table: departments) fields: name, budget, location
-- Product    (table: products)    fields: name, category, price, stock_quantity, supplier
-- Order      (table: orders)      fields: id, quantity, order_date, status
-- Project    (table: projects)    fields: name, description, budget, status, start_date
-
-QUESTION TYPES:
-- lookup       : find details about one specific thing (e.g. "What is Sarah's salary?")
-- list         : list multiple items (e.g. "List all employees in Engineering")
-- comparison   : find highest/lowest/best (e.g. "Who earns the most?")
-- aggregation  : count/sum/average (e.g. "How many employees are in each department?")
-- cross_entity : involves 2+ entity types in one question (e.g. "Which Engineering employees work on projects managed by Sarah?")
-- other        : cannot be answered from the database
-
-FILTER KEY NAMES to use:
-  For Employee:   employee_name, employee_role
-  For Department: department_name
-  For Product:    product_name, category
-  For Order:      order_status
-  For Project:    project_name, project_status
-
-INSTRUCTIONS:
-1. Return ONLY a JSON object. No explanation, no markdown, no code fences.
-2. "entities" must be a list of entity names from the list above.
-3. "filters" must be a dict of filter_key: extracted_value pairs.
-4. "projections" must be a list of column names the user wants to see.
-5. "question_type" must be exactly one of the types above.
-
-EXAMPLE INPUT:  "Which employees in Engineering are working on projects managed by Sarah?"
-EXAMPLE OUTPUT: {{"entities": ["Employee", "Department", "Project"], "filters": {{"department_name": "Engineering", "employee_name": "Sarah"}}, "projections": ["employee_name", "project_name", "assignment_role"], "question_type": "cross_entity"}}
-
-User question: "{question}"
-
-JSON:"""
-
-    start_time = time.time()
-
-    try:
-        response = requests.post(
-            f"{base_url}/api/generate",
-            json={
-                "model": fast_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": 300,
-                },
-            },
-            timeout=120,
+    if not filters.get("employee_name"):
+        whose_match = re.search(
+            r"\bwhat\s+(?:is|are)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)(?:\'s)?\s+\w+",
+            question
         )
-        response.raise_for_status()
-        raw: str = response.json().get("response", "").strip()
+        if whose_match:
+            candidate = whose_match.group(1).strip()
+            schema_entities = _get_valid_entities()
+            if candidate not in schema_entities:
+                filters["employee_name"] = candidate
 
-    except requests.RequestException as e:
-        latency_ms = (time.time() - start_time) * 1000
+    return filters
+
+
+def _extract_projections(question: str) -> List[str]:
+    q_lower = question.lower()
+    projections = []
+    for keyword, projection in _PROJECTION_KEYWORDS.items():
+        if keyword in q_lower and projection not in projections:
+            projections.append(projection)
+    return projections
+
+
+def _detect_entities_from_keywords(question: str) -> List[str]:
+    schema_keywords = _get_schema_keywords()
+    q_lower = question.lower()
+    detected = []
+
+    priority_order = ["Employee", "Department", "Product", "Order", "Project"]
+    for entity in priority_order:
+        triggers = schema_keywords["entity_triggers"].get(entity, [])
+        for trigger in triggers:
+            if re.search(rf"\b{re.escape(trigger)}\b", q_lower):
+                if entity not in detected:
+                    detected.append(entity)
+                break
+
+    return detected
+
+
+def _detect_question_type(question: str) -> Tuple[str, bool]:
+    q_lower = question.lower()
+    for pattern, q_type in _QUESTION_TYPE_PATTERNS:
+        if pattern.search(q_lower):
+            return q_type, True
+    return "lookup", False
+
+
+def _layer1_pattern_extraction(question: str) -> Optional[EntityExtractionResult]:
+    q_lower = question.lower()
+
+    if _OFF_TOPIC_PATTERNS.search(q_lower):
         return EntityExtractionResult(
             entities=[],
             filters={},
             projections=[],
             question_type="other",
-            extraction_method="llm_error",
-            latency_ms=round(latency_ms, 2),
+            extraction_method="pattern",
+            confidence_score=ExtractionConfidence.HIGH,
+            confidence_breakdown={"off_topic_detected": 1.0},
+            escalation_reason="",
         )
 
-    latency_ms = (time.time() - start_time) * 1000
+    entities = _detect_entities_from_keywords(question)
+    if not entities:
+        return None
 
-    # ── Parse JSON from LLM response ─────────────────────────
-    parsed = _parse_llm_json(raw)
+    filters = _extract_named_values(question)
+    projections = _extract_projections(question)
+    question_type, type_resolved = _detect_question_type(question)
 
-    valid_entities = {"Employee", "Department", "Product", "Order", "Project"}
-    valid_types    = {"lookup", "list", "comparison", "aggregation", "cross_entity", "other"}
+    if len(entities) >= 2:
+        question_type = "cross_entity" if question_type == "lookup" else question_type
 
-    entities    = [e for e in parsed.get("entities", []) if e in valid_entities]
-    filters     = parsed.get("filters", {})
-    projections = parsed.get("projections", [])
-    q_type      = parsed.get("question_type", "lookup")
+    has_clear_structure = bool(entities and (filters or projections))
+    confidence, breakdown = _compute_confidence(
+        entities, filters, question_type,
+        has_clear_structure, projections, "pattern"
+    )
 
-    if q_type not in valid_types:
-        q_type = "lookup"
+    if confidence < ExtractionConfidence.TRUST_THRESHOLD:
+        return None
 
-    # Safety: if 2+ entities detected and not already cross_entity, upgrade
-    if len(set(entities)) >= 2 and q_type == "lookup":
-        q_type = "cross_entity"
+    logger.debug("Layer 1 extraction: entities=%s confidence=%.2f", entities, confidence)
 
     return EntityExtractionResult(
         entities=entities,
-        filters={k: str(v) for k, v in filters.items() if v},
+        filters=filters,
         projections=projections,
-        question_type=q_type,
-        extraction_method="llm",
-        latency_ms=round(latency_ms, 2),
+        question_type=question_type,
+        extraction_method="pattern",
+        confidence_score=confidence,
+        confidence_breakdown=breakdown,
+        escalation_reason="",
     )
 
 
-def _parse_llm_json(raw: str) -> dict:
-    """Robustly parse JSON from LLM output.
+def _layer2_spacy_extraction(question: str) -> Optional[EntityExtractionResult]:
+    nlp = _load_nlp()
+    if nlp is None:
+        return None
 
-    Strips markdown fences, finds the first { } block, and
-    attempts json.loads. Returns empty dict on any failure.
+    doc = nlp(question)
+    entities = _detect_entities_from_keywords(question)
+    filters = _extract_named_values(question)
+    projections = _extract_projections(question)
+    question_type, type_resolved = _detect_question_type(question)
 
-    Args:
-        raw: Raw string from LLM response.
+    has_manager_relation = False
+    has_assignment_relation = False
 
-    Returns:
-        dict: Parsed JSON or {} on failure.
-    """
-    # Strip markdown fences
+    for token in doc:
+        if token.lemma_ in {"manage", "lead", "run", "head", "oversee"}:
+            has_manager_relation = True
+            if "Project" not in entities:
+                entities.append("Project")
+            subj_tokens = [t for t in token.subtree if t.dep_ in {"nsubj", "nsubjpass"}]
+            obj_tokens = [t for t in token.subtree if t.dep_ in {"dobj", "pobj", "attr"}]
+
+            for obj_tok in obj_tokens:
+                span_text = obj_tok.text
+                if obj_tok.ent_type_ == "PERSON" or (obj_tok.text[0].isupper() and len(obj_tok.text) > 2):
+                    if "manager_name" not in filters:
+                        filters["manager_name"] = span_text
+
+            for subj_tok in subj_tokens:
+                if subj_tok.ent_type_ == "PERSON":
+                    if "manager_name" not in filters:
+                        filters["manager_name"] = subj_tok.text
+
+        if token.lemma_ in {"assign", "work", "involve", "participate"}:
+            has_assignment_relation = True
+            if "Employee" not in entities:
+                entities.append("Employee")
+
+    for ent in doc.ents:
+        if ent.label_ == "PERSON":
+            if "employee_name" not in filters and "manager_name" not in filters:
+                if _MANAGER_PATTERNS.search(question[:ent.start_char]):
+                    filters["manager_name"] = ent.text
+                else:
+                    filters["employee_name"] = ent.text
+        elif ent.label_ == "ORG":
+            if "department_name" not in filters:
+                valid_entities = _get_valid_entities()
+                if ent.text not in valid_entities:
+                    filters["department_name"] = ent.text
+
+    if len(entities) >= 2:
+        question_type = "cross_entity" if question_type == "lookup" else question_type
+
+    has_clear_structure = has_manager_relation or has_assignment_relation or bool(doc.ents)
+    confidence, breakdown = _compute_confidence(
+        entities, filters, question_type,
+        has_clear_structure, projections, "spacy"
+    )
+
+    if confidence < ExtractionConfidence.TRUST_THRESHOLD:
+        return None
+
+    logger.debug("Layer 2 spaCy extraction: entities=%s confidence=%.2f", entities, confidence)
+
+    return EntityExtractionResult(
+        entities=entities,
+        filters=filters,
+        projections=projections,
+        question_type=question_type,
+        extraction_method="spacy",
+        confidence_score=confidence,
+        confidence_breakdown=breakdown,
+        escalation_reason="",
+    )
+
+
+@lru_cache(maxsize=256)
+def _cached_llm_extraction(question_normalized: str) -> Optional[str]:
+    model_cfg = _load_model_config()
+    valid_entities = _get_valid_entities()
+    schema = _load_schema()
+
+    entity_descriptions = []
+    for entity, node_data in schema["nodes"].items():
+        filterable_cols = list(node_data.get("filterable_columns", {}).keys())
+        entity_descriptions.append(f"  - {entity}: filterable by {filterable_cols}")
+
+    entity_desc_str = "\n".join(entity_descriptions)
+
+    filter_key_docs = (
+        "employee_name, department_name, product_name, project_name, "
+        "order_status (pending/processing/shipped/delivered/cancelled), "
+        "project_status (planning/active/completed/on_hold), "
+        "manager_name, project_department, category, employee_role"
+    )
+
+    prompt = f"""You are a database entity extractor. Return ONLY a valid JSON object, nothing else.
+
+AVAILABLE ENTITIES AND THEIR FILTERABLE FIELDS:
+{entity_desc_str}
+
+VALID ENTITY NAMES (use exactly these): {valid_entities}
+
+QUESTION TYPES: lookup, list, comparison, aggregation, cross_entity, other
+
+FILTER KEYS: {filter_key_docs}
+
+RULES:
+1. Return ONLY JSON. No markdown, no explanation.
+2. entities: list of entity names from the valid list above only.
+3. filters: dict of filter_key to value. Only include explicitly stated filters.
+4. projections: list of field names the user wants to see.
+5. question_type: exactly one type from the list above.
+6. If question cannot be answered from this database schema, use question_type "other" with empty entities.
+7. "managed by X" → filter key "manager_name" with value X.
+8. "projects in X department" → filter key "project_department" with value X.
+9. For list questions with 2+ entities, use question_type "cross_entity".
+
+EXAMPLES:
+Q: "What is Sarah Connor salary?" → {{"entities": ["Employee"], "filters": {{"employee_name": "Sarah Connor"}}, "projections": ["salary", "role"], "question_type": "lookup"}}
+Q: "Who manages API Gateway Rebuild?" → {{"entities": ["Project"], "filters": {{"project_name": "API Gateway Rebuild"}}, "projections": ["manager_name"], "question_type": "lookup"}}
+Q: "Employees on projects managed by Don Draper" → {{"entities": ["Employee", "Project"], "filters": {{"manager_name": "Don Draper"}}, "projections": ["employee_name", "project_name", "assignment_role"], "question_type": "cross_entity"}}
+Q: "What is the weather?" → {{"entities": [], "filters": {{}}, "projections": [], "question_type": "other"}}
+
+User question: "{question_normalized}"
+
+JSON:"""
+
+    try:
+        resp = requests.post(
+            f"{model_cfg['ollama_base_url']}/api/generate",
+            json={
+                "model": model_cfg["fast_model"],
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": 200,
+                    "num_ctx": 2048,
+                },
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except requests.RequestException as exc:
+        logger.warning("LLM call failed: %s", exc)
+        return None
+
+
+def _parse_and_validate_llm_response(raw: str) -> Optional[EntityExtractionResult]:
+    if not raw:
+        return None
+
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-
-    # Find the JSON object
     start = cleaned.find("{")
-    end   = cleaned.rfind("}") + 1
-
+    end = cleaned.rfind("}") + 1
     if start == -1 or end == 0:
-        return {}
+        logger.warning("LLM response contains no JSON object")
+        return None
 
     json_str = cleaned[start:end]
 
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        # Try to fix common LLM JSON mistakes
+    parsed = None
+    for attempt in [
+        lambda s: json.loads(s),
+        lambda s: json.loads(s.replace("'", '"')),
+        lambda s: json.loads(re.sub(r",\s*([}\]])", r"\1", s)),
+    ]:
         try:
-            # Replace single quotes with double quotes
-            fixed = json_str.replace("'", '"')
-            return json.loads(fixed)
-        except json.JSONDecodeError:
-            return {}
+            parsed = attempt(json_str)
+            break
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if parsed is None:
+        logger.warning("All JSON parse attempts failed for LLM response")
+        return None
+
+    valid_entities = set(_get_valid_entities())
+    valid_types = {"lookup", "list", "comparison", "aggregation", "cross_entity", "other"}
+
+    raw_entities = parsed.get("entities", [])
+    entities = [e for e in raw_entities if e in valid_entities]
+
+    invalid = set(raw_entities) - valid_entities
+    if invalid:
+        logger.warning("LLM returned invalid entities (rejected): %s", invalid)
+
+    filters = {k: str(v) for k, v in parsed.get("filters", {}).items() if v}
+    projections = [str(p) for p in parsed.get("projections", [])]
+    q_type = parsed.get("question_type", "lookup")
+
+    if q_type not in valid_types:
+        logger.warning("LLM returned invalid question_type '%s', defaulting to lookup", q_type)
+        q_type = "lookup"
+
+    if len(set(entities)) >= 2 and q_type in ("lookup", "list"):
+        q_type = "cross_entity"
+
+    has_clear_structure = bool(entities and (filters or projections))
+    confidence, breakdown = _compute_confidence(
+        entities, filters, q_type, has_clear_structure, projections, "llm"
+    )
+
+    return EntityExtractionResult(
+        entities=entities,
+        filters=filters,
+        projections=projections,
+        question_type=q_type,
+        extraction_method="llm",
+        confidence_score=confidence,
+        confidence_breakdown=breakdown,
+        escalation_reason="",
+    )
 
 
-# ============================================================
-# PUBLIC ENTRY POINT
-# ============================================================
+def _layer3_llm_extraction(question: str) -> EntityExtractionResult:
+    question_normalized = re.sub(r"\s+", " ", question.strip().lower())
+
+    start = time.time()
+    raw = _cached_llm_extraction(question_normalized)
+    latency_ms = round((time.time() - start) * 1000, 2)
+
+    result = _parse_and_validate_llm_response(raw)
+
+    if result is None:
+        logger.warning("LLM extraction produced no valid result for: '%s'", question)
+        return EntityExtractionResult(
+            entities=[],
+            filters={},
+            projections=[],
+            question_type="other",
+            extraction_method="llm_failed",
+            latency_ms=latency_ms,
+            confidence_score=0.0,
+            confidence_breakdown={"llm_parse_failed": 0.0},
+            escalation_reason="LLM returned unparseable response",
+        )
+
+    result.latency_ms = latency_ms
+
+    if result.confidence_score < ExtractionConfidence.TRUST_THRESHOLD and result.question_type != "other":
+        logger.warning(
+            "LLM extraction confidence %.2f below threshold for: '%s'",
+            result.confidence_score, question
+        )
+        result.escalation_reason = (
+            f"LLM confidence {result.confidence_score:.2f} below trust threshold "
+            f"{ExtractionConfidence.TRUST_THRESHOLD}"
+        )
+
+    logger.debug(
+        "Layer 3 LLM extraction: entities=%s confidence=%.2f method=%s",
+        result.entities, result.confidence_score, result.extraction_method
+    )
+    return result
+
 
 def extract_entities(question: str) -> EntityExtractionResult:
-    """Extract entities, filters, and question type from a user question.
+    start = time.time()
+    question = question.strip()
 
-    Runs Tier 1 (rules) first. If rules confidently identify at
-    least one entity, returns immediately. Otherwise calls Tier 2
-    (LLM) for complex or unrecognized questions.
+    result = _layer1_pattern_extraction(question)
+    if result is not None:
+        result.latency_ms = round((time.time() - start) * 1000, 2)
+        logger.info(
+            "Extraction via pattern: entities=%s type=%s confidence=%.2f latency=%.0fms",
+            result.entities, result.question_type, result.confidence_score, result.latency_ms
+        )
+        return result
 
-    Args:
-        question: Raw user question as typed.
+    result = _layer2_spacy_extraction(question)
+    if result is not None:
+        result.latency_ms = round((time.time() - start) * 1000, 2)
+        logger.info(
+            "Extraction via spaCy: entities=%s type=%s confidence=%.2f latency=%.0fms",
+            result.entities, result.question_type, result.confidence_score, result.latency_ms
+        )
+        return result
 
-    Returns:
-        EntityExtractionResult with all fields populated.
+    logger.info("Layers 1+2 insufficient (confidence below threshold), escalating to LLM")
+    result = _layer3_llm_extraction(question)
+    result.latency_ms = round((time.time() - start) * 1000, 2)
 
-    Example:
-        >>> result = extract_entities("What is Sarah Connor's salary?")
-        >>> result.entities
-        ['Employee']
-        >>> result.filters
-        {'employee_name': 'Sarah Connor'}
-        >>> result.question_type
-        'lookup'
-    """
-    start_time = time.time()
-
-    # ── Tier 1: Rules ─────────────────────────────────────────
-    rule_result = _rule_based_extraction(question)
-
-    if rule_result is not None:
-        rule_result.latency_ms = round((time.time() - start_time) * 1000, 2)
-        return rule_result
-
-    # ── Tier 2: LLM ───────────────────────────────────────────
-    llm_result = _llm_extraction(question)
-    llm_result.latency_ms = round((time.time() - start_time) * 1000, 2)
-    return llm_result
+    logger.info(
+        "Extraction via LLM: entities=%s type=%s confidence=%.2f latency=%.0fms",
+        result.entities, result.question_type, result.confidence_score, result.latency_ms
+    )
+    return result

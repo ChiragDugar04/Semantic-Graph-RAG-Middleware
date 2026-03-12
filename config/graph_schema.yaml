@@ -31,9 +31,11 @@ nodes:
       - column: hire_date
         alias: hire_date
         label: "Hire Date"
+        default_hidden: true
       - column: email
         alias: email
         label: "Email"
+        default_hidden: true
     # Columns that can appear in WHERE filters
     filterable_columns:
       name:
@@ -64,6 +66,7 @@ nodes:
       - column: location
         alias: location
         label: "Location"
+        default_hidden: true
     filterable_columns:
       name:
         match_type: like
@@ -98,6 +101,7 @@ nodes:
       - column: supplier
         alias: supplier
         label: "Supplier"
+        default_hidden: true
     filterable_columns:
       name:
         match_type: like
@@ -149,6 +153,7 @@ nodes:
       - column: description
         alias: description
         label: "Description"
+        default_hidden: true
       - column: budget
         alias: project_budget
         label: "Budget"
@@ -162,6 +167,10 @@ nodes:
       - column: end_date
         alias: end_date
         label: "End Date"
+      - column: manager_id
+        alias: manager_id_raw
+        label: "Manager ID"
+        is_hidden: true
     filterable_columns:
       name:
         match_type: like

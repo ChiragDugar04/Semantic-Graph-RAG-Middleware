@@ -1,21 +1,6 @@
-"""
-app.py
-
-🕸️ Semantic Graph RAG Assistant — Streamlit Frontend
-Chat-style interface with persistent Glass Box audit trail.
-
-Run with:
-    streamlit run app.py
-
-FIX NOTES:
-  - Removed st.rerun() after answer — audit trail now persists until
-    next question. History loop re-renders all previous traces.
-  - Added ⓪ Semantic Graph Traversal panel showing path, method,
-    tables, and timing from the new graph pipeline.
-"""
-
 from __future__ import annotations
 
+import logging
 import yaml
 import requests
 import mysql.connector
@@ -24,26 +9,22 @@ import pandas as pd
 
 from pathlib import Path
 from datetime import datetime
-
 from middleware.pipeline import run_pipeline, _graph
-from middleware.models import MiddlewareTrace
+from middleware.models import MiddlewareTrace, ExtractionConfidence
 
-
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
-    page_title="Semantic Graph RAG Assistant",
+    page_title="Graph RAG Assistant",
     page_icon="🕸️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-
-# ============================================================
-# CSS
-# ============================================================
 
 st.markdown("""
 <style>
@@ -57,25 +38,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
-
 def init_session_state() -> None:
     defaults = {
-        "messages":             [],
-        "total_questions":      0,
-        "healing_count":        0,
-        "db_latencies":         [],
+        "messages": [],
+        "total_questions": 0,
+        "healing_count": 0,
+        "db_latencies": [],
+        "layer_counts": {"pattern": 0, "spacy": 0, "llm": 0, "llm_failed": 0},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
-
-# ============================================================
-# STATUS HELPERS
-# ============================================================
 
 def check_mysql() -> tuple[bool, str]:
     try:
@@ -94,15 +68,15 @@ def check_mysql() -> tuple[bool, str]:
         conn.close()
         return True, f"{cfg['database']} · {count} employees"
     except Exception as e:
-        return False, str(e)[:50]
+        return False, str(e)[:60]
 
 
 def check_ollama() -> tuple[bool, bool]:
     try:
         resp = requests.get("http://localhost:11434/api/tags", timeout=5)
         models = [m["name"] for m in resp.json().get("models", [])]
-        fast_ok  = any("qwen2.5:1.5b" in m for m in models)
-        synth_ok = any("llama3.2:3b"  in m for m in models)
+        fast_ok = any("qwen2.5:1.5b" in m for m in models)
+        synth_ok = any("qwen2.5:1.5b" in m for m in models)
         return fast_ok, synth_ok
     except Exception:
         return False, False
@@ -115,14 +89,10 @@ def check_graph() -> tuple[int, int]:
         return 0, 0
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
 def render_sidebar() -> None:
     with st.sidebar:
-        st.header("🕸️ Semantic Graph RAG")
-        st.caption("MySQL · Semantic Graph · LLM Synthesis")
+        st.header("🕸️ Graph RAG Assistant")
+        st.caption("MySQL · Semantic Graph · 3-Layer Extraction")
         st.caption("No Vector DB · No Fine-tuning · No Text-to-SQL")
 
         st.divider()
@@ -132,9 +102,9 @@ def render_sidebar() -> None:
         fast_ok, synth_ok = check_ollama()
         nodes, edges = check_graph()
 
-        st.caption(f"{'🟢' if mysql_ok  else '🔴'} MySQL — {mysql_msg}")
-        st.caption(f"{'🟢' if fast_ok   else '🔴'} qwen2.5:1.5b (extraction)")
-        st.caption(f"{'🟢' if synth_ok  else '🔴'} llama3.2:3b (synthesis)")
+        st.caption(f"{'🟢' if mysql_ok else '🔴'} MySQL — {mysql_msg}")
+        st.caption(f"{'🟢' if fast_ok else '🔴'} qwen2.5:1.5b (LLM fallback)")
+        st.caption(f"{'🟢' if synth_ok else '🔴'} qwen2.5:1.5b (synthesis)")
         st.caption(f"🟢 Semantic Graph — {nodes} nodes · {edges} edges")
 
         st.divider()
@@ -152,71 +122,50 @@ def render_sidebar() -> None:
 
         st.divider()
 
+        lc = st.session_state.layer_counts
+        total_q = max(st.session_state.total_questions, 1)
+        st.markdown("**Extraction Layer Usage**")
+        st.caption(f"🟢 Pattern (0ms): {lc['pattern']} ({lc['pattern'] * 100 // total_q}%)")
+        st.caption(f"🔵 spaCy (~5ms): {lc['spacy']} ({lc['spacy'] * 100 // total_q}%)")
+        st.caption(f"🟣 LLM (~15s): {lc['llm']} ({lc['llm'] * 100 // total_q}%)")
+        if lc["llm_failed"] > 0:
+            st.caption(f"🔴 LLM Failed: {lc['llm_failed']}")
+
+        st.divider()
+
         st.markdown("**Architecture**")
         st.caption(
             "Question\n"
-            "↓ rules + qwen2.5:1.5b\n"
-            "Entity Extraction\n"
-            "↓ NetworkX graph\n"
-            "Graph Traversal\n"
+            "↓ Layer 1: Pattern Match (0ms)\n"
+            "↓ Layer 2: spaCy Parse (~5ms)\n"
+            "↓ Layer 3: LLM Fallback (~15s)\n"
+            "Confidence Scoring\n"
+            "↓ NetworkX Graph Traversal\n"
             "↓ GraphQueryBuilder\n"
-            "SQL Query\n"
-            "↓ MySQL direct\n"
-            "DB Result\n"
-            "↓ llama3.2:3b\n"
+            "↓ MySQL (pooled)\n"
+            "↓ Template Synthesis\n"
             "Final Answer"
         )
-
         st.divider()
 
-        st.markdown("**Single Entity**")
-        for q in [
-            "What is Sarah Connor's salary?",
-            "What is the most expensive product?",
-            "How many Laptop Pro 15 units are in stock?",
-        ]:
-            if st.button(q, key=f"demo_{q}", use_container_width=True):
-                st.session_state["pending_question"] = q
-
-        st.markdown("**Two-Hop Join**")
-        for q in [
-            "List all employees in Engineering",
-            "Who is the highest paid in Marketing?",
-            "Show me all pending orders",
-        ]:
-            if st.button(q, key=f"demo_{q}", use_container_width=True):
-                st.session_state["pending_question"] = q
-
-        st.markdown("**Multi-Hop (Wow)**")
-        for q in [
-            "Which employees are assigned to the API Gateway Rebuild project?",
-            "Who are the employees on projects managed by Don Draper?",
-            "Which employees in Engineering are working on projects managed by Sarah?",
-        ]:
-            if st.button(q, key=f"demo_{q}", use_container_width=True):
-                st.session_state["pending_question"] = q
-
-        st.divider()
-
-        if st.button("🔄 Reset Session", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-
-
-# ============================================================
-# GLASS BOX
-# ============================================================
 
 _METHOD_BADGE = {
     "single_node": ("⬤ single node", "#6c757d"),
-    "two_hop":     ("⬤ 2-hop join",  "#0d6efd"),
-    "multi_hop":   ("⬤ multi-hop",   "#198754"),
+    "two_hop": ("⬤ 2-hop join", "#0d6efd"),
+    "multi_hop": ("⬤ multi-hop", "#198754"),
 }
 
 _EXTRACT_BADGE = {
-    "rules": ("⬤ rules", "#fd7e14"),
-    "llm":   ("⬤ LLM",   "#6f42c1"),
+    "pattern": ("⬤ pattern", "#fd7e14"),
+    "spacy": ("⬤ spaCy", "#20c997"),
+    "llm": ("⬤ LLM", "#6f42c1"),
+    "llm_failed": ("⬤ LLM failed", "#dc3545"),
+}
+
+_CONFIDENCE_COLOR = {
+    "high": "#198754",
+    "medium": "#fd7e14",
+    "low": "#dc3545",
 }
 
 
@@ -231,7 +180,6 @@ def _badge(label: str, color: str) -> str:
 def render_glass_box(trace: MiddlewareTrace) -> None:
     with st.expander("🔍 Audit Trail — How this answer was generated", expanded=False):
 
-        # ── ⓪ Graph Traversal ────────────────────────────────
         if trace.graph_traversal:
             gt = trace.graph_traversal
             st.markdown("**⓪ Semantic Graph Traversal**")
@@ -263,7 +211,6 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
 
             st.divider()
 
-        # ── ① ② ③ ─────────────────────────────────────────────
         col1, col2, col3 = st.columns(3)
 
         with col1:
@@ -272,6 +219,7 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
                 ee = trace.entity_extraction
                 for ent in ee.entities:
                     st.markdown(_badge(ent, "#0d6efd"), unsafe_allow_html=True)
+
                 extract_label, extract_color = _EXTRACT_BADGE.get(
                     ee.extraction_method, ("⬤ unknown", "#888")
                 )
@@ -280,11 +228,22 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
                     unsafe_allow_html=True,
                 )
                 st.caption(f"Type: `{ee.question_type}`")
+
+                conf_score = ee.confidence_score
+                conf_label = (
+                    "high" if conf_score >= 0.85
+                    else "medium" if conf_score >= ExtractionConfidence.TRUST_THRESHOLD
+                    else "low"
+                )
+                conf_color = _CONFIDENCE_COLOR.get(conf_label, "#888")
+                st.markdown(
+                    f"Confidence: {_badge(f'{conf_score:.0%}', conf_color)}",
+                    unsafe_allow_html=True,
+                )
                 st.caption(f"Latency: `{ee.latency_ms:.0f}ms`")
-            elif trace.intent:
-                st.code(trace.intent.intent_name, language=None)
-                st.caption(f"Model: `{trace.intent.model_used}`")
-                st.caption(f"Latency: `{trace.intent.latency_ms:.0f}ms`")
+
+                if ee.escalation_reason:
+                    st.warning(f"Escalation: {ee.escalation_reason}")
 
         with col2:
             st.markdown("**② Filters Applied**")
@@ -296,14 +255,16 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
                     st.caption("— no filters —")
                 if ee.projections:
                     st.caption(f"Projections: `{ee.projections}`")
-            elif trace.parameters:
-                st.json(trace.parameters.params)
+                if ee.confidence_breakdown:
+                    with st.expander("Confidence breakdown"):
+                        for k, v in ee.confidence_breakdown.items():
+                            st.caption(f"{k}: {v:.2f}")
 
         with col3:
             st.markdown("**③ Database Execution**")
             if trace.db_result:
                 if trace.db_result.self_healing_triggered:
-                    st.warning("Self-healing triggered")
+                    st.warning("No results / fallback triggered")
                     st.caption(f"Reason: {trace.db_result.healing_reason}")
                 else:
                     st.success(f"{trace.db_result.row_count} row(s) returned")
@@ -311,14 +272,12 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
 
         st.divider()
 
-        # ── ④ SQL ─────────────────────────────────────────────
         st.markdown("**④ SQL Executed Against MySQL**")
         if trace.db_result and trace.db_result.query_executed:
             st.code(trace.db_result.query_executed, language="sql")
         else:
             st.caption("— no query executed —")
 
-        # ── ⑤ Raw Data ────────────────────────────────────────
         if (trace.db_result and trace.db_result.rows
                 and not trace.db_result.self_healing_triggered):
             st.markdown("**⑤ Raw Database Response**")
@@ -328,36 +287,40 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
                 hide_index=True,
             )
 
-        # ── ⑥ Timing ─────────────────────────────────────────
         st.divider()
         st.markdown("**⑥ Pipeline Timing Breakdown**")
 
         timings = []
         if trace.entity_extraction:
-            timings.append(("Extraction", f"{trace.entity_extraction.latency_ms:.0f}ms",
-                             trace.entity_extraction.extraction_method))
-        elif trace.intent:
-            timings.append(("Intent LLM", f"{trace.intent.latency_ms:.0f}ms", "qwen2.5:1.5b"))
+            timings.append((
+                "Extraction",
+                f"{trace.entity_extraction.latency_ms:.0f}ms",
+                trace.entity_extraction.extraction_method,
+            ))
 
         if trace.graph_traversal:
-            timings.append(("Graph", f"{trace.graph_traversal.traversal_time_ms:.2f}ms", "NetworkX"))
+            timings.append((
+                "Graph",
+                f"{trace.graph_traversal.traversal_time_ms:.2f}ms",
+                "NetworkX",
+            ))
 
         if trace.db_result:
-            timings.append(("MySQL", f"{trace.db_result.execution_time_ms:.3f}ms", "direct"))
+            timings.append((
+                "MySQL",
+                f"{trace.db_result.execution_time_ms:.3f}ms",
+                "pooled",
+            ))
 
         if trace.total_latency_ms > 0:
-            known = 0
-            if trace.entity_extraction:
-                known += trace.entity_extraction.latency_ms
-            elif trace.intent:
-                known += trace.intent.latency_ms
-            if trace.graph_traversal:
-                known += trace.graph_traversal.traversal_time_ms
-            if trace.db_result:
-                known += trace.db_result.execution_time_ms
+            known = (
+                (trace.entity_extraction.latency_ms if trace.entity_extraction else 0)
+                + (trace.graph_traversal.traversal_time_ms if trace.graph_traversal else 0)
+                + (trace.db_result.execution_time_ms if trace.db_result else 0)
+            )
             synth = trace.total_latency_ms - known
-            if synth > 0:
-                timings.append(("Synthesis LLM", f"{synth:.0f}ms", "llama3.2:3b"))
+            if synth > 50:
+                timings.append(("Synthesis", f"{synth:.0f}ms", "template/LLM"))
 
         timings.append(("TOTAL", f"{trace.total_latency_ms:.0f}ms", "wall clock"))
 
@@ -367,21 +330,19 @@ def render_glass_box(trace: MiddlewareTrace) -> None:
                 st.metric(label=f"{label}\n{note}", value=value)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def _caption_for_trace(trace: MiddlewareTrace) -> str:
     ts = trace.timestamp.strftime("%H:%M:%S")
     gt = trace.graph_traversal
     method_str = gt.traversal_method if gt else "unknown"
-    path_str   = "→".join(gt.path_taken) if gt else "—"
-    heal_note  = " · ⚠ self-healing" if trace.self_healing_triggered else ""
+    path_str = "→".join(gt.path_taken) if gt else "—"
+    heal_note = " · ⚠ fallback" if trace.self_healing_triggered else ""
     db_ms = trace.db_result.execution_time_ms if trace.db_result else 0
+    ee = trace.entity_extraction
+    method_note = f"[{ee.extraction_method}]" if ee else ""
     return (
         f"🕐 {ts} · ⏱ {trace.total_latency_ms:.0f}ms total "
         f"· 🕸️ {path_str} · ⚡ {method_str} "
-        f"· 🗄️ db: `{db_ms:.3f}ms`{heal_note}"
+        f"· 🗄️ db: `{db_ms:.3f}ms` · {method_note}{heal_note}"
     )
 
 
@@ -391,25 +352,28 @@ def update_stats(trace: MiddlewareTrace) -> None:
         st.session_state.healing_count += 1
     if trace.db_result:
         st.session_state.db_latencies.append(trace.db_result.execution_time_ms)
-    st.session_state.db_latencies = st.session_state.db_latencies[-10:]
+    st.session_state.db_latencies = st.session_state.db_latencies[-20:]
 
+    if trace.entity_extraction:
+        method = trace.entity_extraction.extraction_method
+        lc = st.session_state.layer_counts
+        if method in lc:
+            lc[method] += 1
+        elif "llm" in method:
+            lc["llm_failed"] += 1
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> None:
     init_session_state()
     render_sidebar()
 
-    st.title("🕸️ Semantic Graph RAG Assistant")
+    st.title("🕸️ Graph-based RAG Assistant")
     st.caption(
-        "Ask questions about your company data — "
-        "answers are pulled directly from MySQL via dynamic graph traversal."
+        "Ask questions about company data — "
+        "answers pulled directly from MySQL via semantic graph traversal."
     )
     st.divider()
 
-    # ── Render chat history (all previous messages + their glass boxes) ──
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -419,26 +383,24 @@ def main() -> None:
 
     if not st.session_state.messages:
         st.info(
-            "👋 Welcome! Type a question below or pick a demo query from the sidebar.\n\n"
-            "Try: *\"Which employees in Engineering are working on projects managed by Sarah?\"*"
+            "👋 Welcome! Ask a question about the company database.\n\n"
+            "**Try:**\n"
+            "- *What is Alan Turing's salary?*\n"
+            "- *List all employees in Engineering*\n"
+            "- *Which employees are assigned to the API Gateway Rebuild project?*\n"
+            "- *Show me all pending orders*\n"
+            "- *Who is the highest paid in Marketing?*"
         )
 
-    # ── Handle demo sidebar button ────────────────────────────
-    pending = st.session_state.pop("pending_question", None)
-
-    # ── Chat input ────────────────────────────────────────────
     prompt = st.chat_input("Ask about employees, departments, products, orders, or projects…")
-    question = prompt or pending
 
-    if question and question.strip():
-        q = question.strip()
+    if prompt and prompt.strip():
+        q = prompt.strip()
 
-        # Append + render user message
         st.session_state.messages.append({"role": "user", "content": q, "trace": None})
         with st.chat_message("user"):
             st.markdown(q)
 
-        # Run pipeline + render answer
         with st.chat_message("assistant"):
             with st.spinner("Querying database via semantic graph…"):
                 trace = run_pipeline(q)
@@ -450,20 +412,14 @@ def main() -> None:
             else:
                 st.markdown(trace.final_answer)
 
-            # Caption + glass box rendered here — no st.rerun() so they STAY visible
             st.caption(_caption_for_trace(trace))
             render_glass_box(trace)
 
-        # Save to history
-        # Next question will trigger a natural Streamlit re-render which
-        # shows all history including this trace via the loop above.
         st.session_state.messages.append({
             "role": "assistant",
             "content": trace.final_answer,
             "trace": trace,
         })
-        # NOTE: intentionally NO st.rerun() here — that was causing the
-        # audit trail to flash and disappear.
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ class GraphQueryBuilder:
         where_clause, where_params = self._build_where(filters, path, joined_tables)
         order_limit = self._build_order_limit(q_type, entities, filters)
 
-        sql_parts = [f"SELECT {', '.join(select_parts)}", from_clause]
+        sql_parts = [f"SELECT DISTINCT {', '.join(select_parts)}", from_clause]
         sql_parts.extend(join_clauses)
         if where_clause:
             sql_parts.append(f"WHERE {where_clause}")
@@ -184,89 +184,135 @@ class GraphQueryBuilder:
 
         return joins
 
+    def _build_filter_map(self, path: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Build a dynamic filter-key → SQL mapping by reading filterable_columns
+        from the schema for every node in the current path.
+
+        Returns a dict like:
+          {
+            "employee_name":   {"sql": "e.name",     "match": "like"},
+            "employee_role":   {"sql": "e.role",     "match": "like"},
+            "department_name": {"sql": "d.name",     "match": "like"},
+            "project_name":    {"sql": "proj.name",  "match": "like"},
+            "project_status":  {"sql": "proj.status","match": "exact"},
+            ...
+          }
+
+        The key naming convention is:  <entity_lower>_<column>
+        with a special alias for "name" columns → <entity_lower>_name.
+
+        Cross-table lookups (manager_name, project_department) are added
+        as a fixed supplement — they can't live in filterable_columns because
+        they span two tables.
+        """
+        fmap: Dict[str, Dict[str, Any]] = {}
+
+        for entity in path:
+            try:
+                node = self._graph.get_node_data(entity)
+            except Exception:
+                continue
+
+            entity_lower = entity.lower()
+            filterable = node.get("filterable_columns", {})
+
+            for col_key, col_meta in filterable.items():
+                # Canonical filter key: <entity>_<column>
+                # e.g. Employee.name  → employee_name
+                #      Project.status → project_status
+                filter_key = f"{entity_lower}_{col_key}"
+                fmap[filter_key] = {
+                    "sql": col_meta["sql_column"],
+                    "match": col_meta.get("match_type", "like"),
+                    "param_key": filter_key,
+                }
+
+        # ---------------------------------------------------------------- #
+        # Supplement: cross-table lookups that are not in filterable_cols  #
+        # ---------------------------------------------------------------- #
+        if "Project" in path:
+            fmap["manager_name"] = {
+                "sql": "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)",
+                "match": "subquery",
+                "param_key": "manager_name",
+            }
+            fmap["project_department"] = {
+                "sql": "proj.department_id IN (SELECT id FROM departments WHERE name LIKE %(project_department)s)",
+                "match": "subquery",
+                "param_key": "project_department",
+            }
+
+        if "Order" in path:
+            fmap["order_status"] = {
+                "sql": "o.status",
+                "match": "exact",
+                "param_key": "order_status",
+            }
+
+        # department_name via Employee subquery (when Department not in path)
+        if "Employee" in path and "Department" not in path:
+            fmap["department_name"] = {
+                "sql": "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)",
+                "match": "subquery",
+                "param_key": "department_name",
+            }
+
+        return fmap
+
     def _build_where(
         self,
         filters: Dict[str, Any],
         path: List[str],
         joined_tables: Set[str],
     ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Schema-driven WHERE builder.
+
+        Iterates extraction.filters and matches each key against the
+        dynamic filter map built from graph_schema.yaml.  No hardcoded
+        elif chains — adding a new filterable_column to the schema is
+        sufficient to make it filterable here automatically.
+        """
         conditions: List[str] = []
         params: Dict[str, Any] = {}
 
-        has_employees = "Employee" in path
-        has_departments = "Department" in path
-        has_projects = "Project" in path
-        has_products = "Product" in path
-        has_orders = "Order" in path
+        fmap = self._build_filter_map(path)
 
         for filter_key, filter_value in filters.items():
             if not filter_value:
                 continue
-
             filter_value = str(filter_value)
 
-            if filter_key == "employee_name" and has_employees:
-                conditions.append("e.name LIKE %(employee_name)s")
-                params["employee_name"] = f"%{filter_value}%"
-
-            elif filter_key == "employee_role" and has_employees:
-                conditions.append("e.role LIKE %(employee_role)s")
-                params["employee_role"] = f"%{filter_value}%"
-
-            elif filter_key == "department_name":
-                if has_departments:
-                    conditions.append("d.name LIKE %(department_name)s")
-                    params["department_name"] = f"%{filter_value}%"
-                elif has_employees:
-                    conditions.append(
-                        "e.department_id IN "
-                        "(SELECT id FROM departments WHERE name LIKE %(department_name)s)"
-                    )
-                    params["department_name"] = f"%{filter_value}%"
-                else:
-                    logger.warning(
-                        "Filter 'department_name' cannot be applied: "
-                        "neither Department nor Employee in path %s", path
-                    )
-
-            elif filter_key == "project_name" and has_projects:
-                conditions.append("proj.name LIKE %(project_name)s")
-                params["project_name"] = f"%{filter_value}%"
-
-            elif filter_key == "project_status" and has_projects:
-                conditions.append("proj.status = %(project_status)s")
-                params["project_status"] = filter_value
-
-            elif filter_key == "project_department" and has_projects:
-                conditions.append(
-                    "proj.department_id IN "
-                    "(SELECT id FROM departments WHERE name LIKE %(project_department)s)"
+            if filter_key not in fmap:
+                logger.debug(
+                    "Filter key '%s' not in schema filter map for path %s — skipped",
+                    filter_key, path,
                 )
-                params["project_department"] = f"%{filter_value}%"
+                continue
 
-            elif filter_key == "manager_name" and has_projects:
-                conditions.append(
-                    "proj.manager_id IN "
-                    "(SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
-                )
-                params["manager_name"] = f"%{filter_value}%"
+            entry = fmap[filter_key]
+            match_type = entry["match"]
+            sql_col = entry["sql"]
+            param_key = entry["param_key"]
 
-            elif filter_key == "product_name" and has_products:
-                conditions.append("p.name LIKE %(product_name)s")
-                params["product_name"] = f"%{filter_value}%"
+            if match_type == "subquery":
+                # The sql already contains the full condition including param
+                conditions.append(sql_col)
+                params[param_key] = f"%{filter_value}%"
 
-            elif filter_key == "category" and has_products:
-                conditions.append("p.category = %(category)s")
-                params["category"] = filter_value
+            elif match_type == "like":
+                conditions.append(f"{sql_col} LIKE %({param_key})s")
+                params[param_key] = f"%{filter_value}%"
 
-            elif filter_key == "order_status" and has_orders:
-                conditions.append("o.status = %(order_status)s")
-                params["order_status"] = filter_value
+            elif match_type == "exact":
+                conditions.append(f"{sql_col} = %({param_key})s")
+                params[param_key] = filter_value
 
             else:
-                logger.debug(
-                    "Filter key '%s' skipped — no matching table in path %s",
-                    filter_key, path
+                logger.warning(
+                    "Unknown match_type '%s' for filter '%s' — skipped",
+                    match_type, filter_key,
                 )
 
         return " AND ".join(conditions), params

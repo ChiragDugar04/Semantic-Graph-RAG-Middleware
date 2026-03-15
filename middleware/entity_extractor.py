@@ -105,7 +105,17 @@ _OFF_TOPIC_PATTERNS = re.compile(
 )
 
 _MANAGER_PATTERNS = re.compile(
-    r"\b(managed by|manages|manager of|who manages|who leads|who runs|led by|run by|head of|in charge of)\b",
+    r"\b(managed by|manages|manager of|who manages|who leads|who runs|led by|run by|head of|in charge of"
+    r"|supervised by|supervises|overseen by)\b",
+    re.I,
+)
+
+# N4: "reports to / reporting to" signals an org-chart hierarchy query.
+# This is intentionally SEPARATE from _MANAGER_PATTERNS because it routes
+# to a different path (Employee→Department via department manager FK)
+# rather than the project-manager path that manager_name triggers.
+_REPORTS_TO_PATTERNS = re.compile(
+    r"\b(reports to|reporting to|who does .{1,40} report to|direct reports of)\b",
     re.I,
 )
 
@@ -334,10 +344,88 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
             filters["product_category"] = cat_val
             break
 
+    # R5: Supplier filter extraction.
+    # "supplied by TechSupply Co" / "from supplier OfficeWorld"
+    # Product.supplier is now a filterable_column → filter key "product_supplier".
+    supplier_match = re.search(
+        r"\b(?:supplied by|supplier|from supplier|made by|manufactured by)\s+"
+        r"([A-Za-z][A-Za-z0-9\s]{1,30}?)(?:\s*$|\s*[,\?.])",
+        question,  # use original case to preserve proper noun capitalisation
+    )
+    if supplier_match:
+        sup_val = supplier_match.group(1).strip()
+        if sup_val.lower() not in _NAME_NOISE and len(sup_val) > 1:
+            filters["product_supplier"] = sup_val
+            logger.debug("Phase 0 supplier extraction: product_supplier=%s", sup_val)
+
+    # R6: Department location extraction.
+    # "Building A", "Building 3", "Floor 2" etc. — the schema's Department.location
+    # filterable_column generates filter key "department_location" in _build_filter_map.
+    # Single-letter/digit identifiers (e.g. "A") are stripped by _scan_proper_noun_candidates
+    # (min 2 chars), so we capture them explicitly here in Phase 0 before any noun scan.
+    # Run on ORIGINAL question (not q_lower) so "Building A" (uppercase A) is matched.
+    loc_match = re.search(
+        r"\b(Building\s+[A-Z0-9]\w*|Floor\s+\d+|Site\s+[A-Z0-9]\w*|Campus\s+[A-Z0-9]\w*)",
+        question,
+    )
+    if not loc_match:
+        # Fallback: "located in <phrase>"
+        loc_match = re.search(
+            r"\blocated\s+in\s+([A-Za-z0-9][A-Za-z0-9\s]{1,20}?)(?:\s*$|\s*[,\?.])",
+            question,
+        )
+    if loc_match:
+        raw_loc = loc_match.group(1).strip() if loc_match.lastindex and loc_match.lastindex >= 1 else loc_match.group(0).strip()
+        raw_loc = re.sub(r"^located\s+in\s+", "", raw_loc, flags=re.I).strip()
+        cap_loc = " ".join(w.capitalize() for w in raw_loc.split())
+        if cap_loc and cap_loc.lower() not in _NAME_NOISE:
+            filters["department_location"] = cap_loc
+            logger.debug("Phase 0 location extraction: department_location=%s", cap_loc)
+
+    # ------------------------------------------------------------------ #
+    # Phase 0.5 — Subject-first person lock                             #
+    # Handles two patterns:                                             #
+    #   (a) "[Name] is in which project" — name at sentence START       #
+    #   (b) "in which project is Sarah Connor" — name at sentence END   #
+    # Without this lock Phase 2 sees "project" in context around the   #
+    # name and maps it to project_name, causing 0-row queries.         #
+    # ------------------------------------------------------------------ #
+    # N1 FIX: These patterns must NOT use re.I.
+    # Python's re.I makes [A-Z] match lowercase letters, so "which employees"
+    # would match [A-Z][a-z]+ and "managed by Alan Turing" would match as a name.
+    # Person names are always Title-Case proper nouns — no case-insensitive flag needed.
+    _SUBJECT_RELATIONAL_START = re.compile(
+        r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s+"
+        r"(?:is|was|are|were)\s+"
+        r"(?:in|on|assigned|part of|working|involved|a member)",
+        # NO re.I — [A-Z] must match uppercase only
+    )
+    # Pattern (b): question ends with a name after a relational question word
+    # "in which [entity] is [Name]?" or "which [entity] is [Name] in?"
+    _SUBJECT_RELATIONAL_END = re.compile(
+        r"\b(?:is|are|was)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s*\??\s*$",
+        # NO re.I — [A-Z] must match uppercase only
+    )
+
+    subj_match = _SUBJECT_RELATIONAL_START.match(question.strip())
+    if not subj_match:
+        subj_match = _SUBJECT_RELATIONAL_END.search(question.strip())
+
+    if subj_match:
+        subj_name = subj_match.group(1).strip()
+        if subj_name.lower() not in _NAME_NOISE and subj_name not in _get_valid_entities():
+            filters["employee_name"] = subj_name
+            locked_names_early = {subj_name.lower()}
+            logger.debug("Phase 0.5 subject lock: employee_name=%s", subj_name)
+        else:
+            locked_names_early = set()
+    else:
+        locked_names_early = set()
+
     # ------------------------------------------------------------------ #
     # Phase 1 — Manager-first relational lock                             #
     # ------------------------------------------------------------------ #
-    locked_names: set = set()   # names claimed here are excluded from Phase 2
+    locked_names: set = locked_names_early   # inherit early locks
 
     manager_match = _MANAGER_PATTERNS.search(question)
     if manager_match:
@@ -352,6 +440,23 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
                 filters["manager_name"] = mgr_name
                 locked_names.add(mgr_name.lower())
                 logger.debug("Manager-first lock: manager_name=%s", mgr_name)
+
+    # N4: Org-chart hierarchy lock — "reports to [Name]" / "reporting to [Name]"
+    # This is distinct from manager_name (project manager). It means:
+    # "find employees whose department is managed by [Name]".
+    # Stores the result in reports_to_name which pipeline and builder handle separately.
+    reports_to_match = _REPORTS_TO_PATTERNS.search(question)
+    if reports_to_match:
+        after_rt = question[reports_to_match.end():].strip()
+        rt_name_match = re.search(
+            r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})", after_rt
+        )
+        if rt_name_match:
+            rt_name = rt_name_match.group(1).strip()
+            if rt_name.lower() not in _NAME_NOISE:
+                filters["reports_to_name"] = rt_name
+                locked_names.add(rt_name.lower())
+                logger.debug("Reports-to lock: reports_to_name=%s", rt_name)
 
     # ------------------------------------------------------------------ #
     # Phase 2 — Proper noun scan with entity-context assignment           #
@@ -391,15 +496,23 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
 
         context = _context_around(cand, q_lower)
 
-        # Determine filter key — directional check takes priority over bidirectional.
-        # Step 1: check BEFORE_CANDIDATE_SIGNALS (left-context only, 30 char window).
-        # A nearby preposition like "in [Sales]" or "for [Standing Desk]" is
-        # higher-confidence than a distant bidirectional "project" keyword that
-        # could be far from the candidate (D4/D8).
+        # Step 1: check BEFORE_CANDIDATE_SIGNALS (left-context only).
+        # Each signal has its own window: tight for ambiguous prepositions like
+        # "of" (only fires for "units of [Product]", not "emails of everyone"),
+        # wider for unambiguous ones like "for" and "in".
+        # R5 guard: if product_supplier was already captured in Phase 0, skip
+        # the "for" product_name signal so the supplier name is not ALSO assigned
+        # to product_name (e.g. "stock for all items supplied by TechSupply Co").
         assigned_key: Optional[str] = None
         idx = q_lower.find(cand_lower)
-        left_ctx = q_lower[max(0, idx - 30):idx]
-        for trigger, fkey in _BEFORE_CANDIDATE_SIGNALS:
+        for trigger, fkey, window in [
+            ("for",  "product_name",    30),   # "orders for [Standing Desk]"
+            ("of",   "product_name",     8),   # "units of [Webcam HD]" — TIGHT to avoid "emails of everyone"
+            ("in",   "department_name", 30),   # "employees in [Sales]"
+        ]:
+            if fkey == "product_name" and "product_supplier" in filters:
+                continue  # R5: don't double-assign supplier name to product_name
+            left_ctx = q_lower[max(0, idx - window):idx]
             if re.search(rf"\b{re.escape(trigger)}\b", left_ctx):
                 assigned_key = fkey
                 break
@@ -413,8 +526,25 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
 
         # If no entity-context signal found, fall through to person heuristic
         if assigned_key is None:
+            # R4: Before treating a 2-word Title-Case as a person name, check
+            # if it ends with a known occupational suffix — those are role titles
+            # (e.g. "Senior Engineer", "Operations Manager") that belong in
+            # employee_role, not employee_name.
+            # Suffixes are derived from the roles present in the seed data and
+            # schema — NOT hardcoded arbitrary strings.
+            _ROLE_SUFFIXES = frozenset({
+                "engineer", "manager", "analyst", "coordinator", "director",
+                "specialist", "representative", "advisor", "consultant",
+                "developer", "architect", "lead", "officer", "executive",
+                "associate", "technician", "administrator", "supervisor",
+                "copywriter", "strategist", "liaison",
+            })
+            cand_words = cand.split()
+            last_word = cand_words[-1].lower() if cand_words else ""
+            if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$", cand) and last_word in _ROLE_SUFFIXES:
+                assigned_key = "employee_role"
             # Two-word Title-Case with no entity signal → likely a person name
-            if re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+$", cand):
+            elif re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+$", cand):
                 assigned_key = "employee_name"
             else:
                 # Single capitalised word or ambiguous multi-word — skip
@@ -435,8 +565,11 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
     _PROJECT_CONTEXT = {"project", "initiative", "assigned to", "working on",
                         "on the", "part of"}
 
-    # Only run if we haven't already captured the value via Phase 2
-    if "product_name" not in filters:
+    # Only run if we haven't already captured the value via Phase 2.
+    # N3 FIX: Also skip if product_supplier is already set — a supplier query like
+    # "stock for all items supplied by TechSupply Co" has "of the current stock"
+    # which would match and extract "The Current" as a phantom product_name.
+    if "product_name" not in filters and "product_supplier" not in filters:
         if any(kw in q_lower for kw in _PRODUCT_CONTEXT):
             # Extract any 1-3 word sequence after "of", "for", "about" or
             # before "stock", "units", "inventory", "price" — case-insensitive
@@ -605,6 +738,38 @@ def _layer1_pattern_extraction(question: str) -> Optional[EntityExtractionResult
             escalation_reason="",
         )
 
+    # T2: Graceful decline for query patterns that require SQL capabilities
+    # (HAVING, cross-row aggregation subqueries, temporal comparisons) that the
+    # current GraphQueryBuilder cannot generate correctly.
+    # Detection is purely structural — no entity names are hardcoded.
+    _UNSUPPORTED_PATTERNS = re.compile(
+        r"\b(more than (?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:active\s+)?projects?"  # HAVING COUNT > N
+        r"|assigned to (?:more|over|greater) than (?:\d+|one|two|three|four|five)"  # HAVING variant
+        r"|(?:higher|more|greater|cheaper|less) than (?:the )?average"              # subquery AVG
+        r"|cost more than (?:the )?average"                                          # product subquery
+        r"|started after .{3,60}(?:was|were) (?:completed|finished|done)"           # temporal
+        r"|after .{3,60}(?:ended|was completed|was finished)"                        # temporal variant
+        r")\b",
+        re.I,
+    )
+    if _UNSUPPORTED_PATTERNS.search(q_lower):
+        logger.info("T2: unsupported query pattern detected — returning graceful decline")
+        return EntityExtractionResult(
+            entities=[],
+            filters={},
+            projections=[],
+            question_type="other",
+            extraction_method="pattern",
+            confidence_score=ExtractionConfidence.HIGH,
+            confidence_breakdown={"unsupported_pattern": 1.0},
+            escalation_reason=(
+                "This question requires comparing across multiple rows "
+                "(e.g. HAVING, subquery average, or date comparison between records). "
+                "Try rephrasing: e.g. 'Show employees on more than one project' "
+                "or 'List projects that started in 2025'."
+            ),
+        )
+
     entities = _detect_entities_from_keywords(question)
 
     # Auto-infer entity from named filter values when no keyword trigger fired.
@@ -635,7 +800,11 @@ def _layer1_pattern_extraction(question: str) -> Optional[EntityExtractionResult
     if len(entities) >= 2:
         question_type = "cross_entity" if question_type == "lookup" else question_type
 
-    has_clear_structure = bool(entities and (filters or projections))
+    # R2: A "list all X" query with entities but no named filter is structurally
+    # complete — it's a deliberate request for all records of that entity type.
+    # Penalising it for missing filters causes unnecessary LLM escalation (20s+).
+    is_filterless_list = question_type == "list" and bool(entities) and not filters and not projections
+    has_clear_structure = bool(entities and (filters or projections)) or is_filterless_list
     confidence, breakdown = _compute_confidence(
         entities, filters, question_type,
         has_clear_structure, projections, "pattern"

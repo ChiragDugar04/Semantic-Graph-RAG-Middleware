@@ -93,7 +93,13 @@ def run_pipeline(question: str) -> MiddlewareTrace:
     # fire aggregation from "how many" / "total" keywords, but the user
     # named a specific entity — they want its attributes, not a COUNT(*).
     # Downgrade to lookup so _build_select returns real columns, not COUNT(*).
-    _NAMED_FILTERS = {"product_name", "employee_name", "project_name", "department_name"}
+    # P2 FIX: also include product_supplier and product_category — a question like
+    # "total value of stock supplied by TechSupply Co" fires aggregation from "total"
+    # but the user wants a product list filtered by supplier, not a COUNT(*).
+    _NAMED_FILTERS = {
+        "product_name", "employee_name", "project_name", "department_name",
+        "product_supplier", "product_category",  # P2: named product scope filters
+    }
     if (extraction.question_type == "aggregation"
             and _NAMED_FILTERS & set(extraction.filters.keys())):
         logger.info(
@@ -482,24 +488,52 @@ def _canonical_entity_order(
     # Gate: original list had exactly one entity (the query subject).
     # D7: suppress for comparison queries — we intentionally inserted Employee
     # first so the works_in JOIN returns all employees, not just the manager.
+    #
+    # P1 FIX — Bidirectional-edge guard:
+    # The override must NOT fire when the candidate↔injected relationship is
+    # bidirectional (edges exist in BOTH directions in the schema graph).
+    # Reason: when both directions exist (e.g. Employee↔Project, Employee↔Department),
+    # _expand_entities_from_filters deliberately orders them to select the correct
+    # JOIN direction. Overriding that ordering picks the wrong edge.
+    #
+    # The override SHOULD still fire for unidirectional relationships like
+    # Order→Employee and Order→Product (no Employee→Order or Product→Order edges exist).
+    # In those cases Order is the only valid anchor and the override is correct.
+    #
+    # This check is purely graph-structure-driven — reads the live NetworkX graph,
+    # no entity names or filter keys hardcoded.
     if original_entities and len(set(original_entities)) == 1 and q_type != "comparison":
         candidate = original_entities[0]
         if candidate in entity_set:
             others = entity_set - {candidate}
             if others and all(_graph._graph.has_edge(candidate, other) for other in others):
-                ordered: List[str] = [candidate]
-                secondary = ["Employee", "Department", "Project", "Order", "Product"]
-                for node in secondary:
-                    if node in entity_set and node != candidate:
-                        ordered.append(node)
-                for node in entities:
-                    if node not in ordered:
-                        ordered.append(node)
-                logger.debug(
-                    "Anchor override: %s leads (sole original, reaches all injected nodes)",
-                    candidate,
+                # P1: check if ANY reverse edge exists (injected → candidate)
+                has_any_reverse_edge = any(
+                    _graph._graph.has_edge(other, candidate) for other in others
                 )
-                return ordered
+                if has_any_reverse_edge:
+                    # Bidirectional relationship — injection order was deliberate.
+                    # Fall through to default priority ordering which respects it.
+                    logger.debug(
+                        "Anchor override suppressed for %s: reverse edges exist from injected "
+                        "nodes — respecting _expand_entities_from_filters ordering",
+                        candidate,
+                    )
+                else:
+                    # Unidirectional — candidate is the only valid anchor (e.g. Order).
+                    ordered: List[str] = [candidate]
+                    secondary = ["Employee", "Department", "Project", "Order", "Product"]
+                    for node in secondary:
+                        if node in entity_set and node != candidate:
+                            ordered.append(node)
+                    for node in entities:
+                        if node not in ordered:
+                            ordered.append(node)
+                    logger.debug(
+                        "Anchor override: %s leads (sole original, unidirectional edges only)",
+                        candidate,
+                    )
+                    return ordered
 
     # Default priority for all other combinations (Employee > Dept > Project > Product)
     priority = ["Employee", "Department", "Project", "Order", "Product"]

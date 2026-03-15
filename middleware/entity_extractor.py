@@ -62,7 +62,11 @@ def _get_schema_keywords() -> Dict[str, Any]:
     entity_trigger_map = {
         "Employee": ["employee", "employees", "staff", "worker", "workers", "person", "people", "who", "member"],
         "Department": ["department", "departments", "dept", "team", "division", "group"],
-        "Product": ["product", "products", "item", "items", "stock", "inventory", "unit", "units"],
+        "Product": ["product", "products", "item", "items", "stock", "inventory", "unit", "units",
+                    # D1: category words — 'electronics', 'furniture', etc. must fire Product
+                    # detection so category-only queries work without needing the LLM fallback.
+                    "electronics", "electronic", "furniture", "office supply", "office supplies",
+                    "supply", "supplies"],
         "Order": ["order", "orders", "purchase", "purchases", "bought", "ordered"],
         "Project": ["project", "projects", "initiative", "initiatives", "program", "programs"],
     }
@@ -201,98 +205,352 @@ def _compute_confidence(
     return total, breakdown
 
 
-def _extract_filter_value_for_entity(
-    question: str,
-    entity: str,
-) -> Optional[str]:
-    schema = _load_schema()
-    node_data = schema["nodes"].get(entity, {})
-    filterable = node_data.get("filterable_columns", {})
+# ---------------------------------------------------------------------------
+# Noise words that should never be treated as entity name values
+# ---------------------------------------------------------------------------
+_NAME_NOISE = frozenset({
+    "all", "every", "any", "each", "the", "a", "an",
+    "list", "show", "display", "find", "get", "give",
+    "what", "who", "which", "how", "where", "when", "why",
+    "me", "us", "i", "my", "our", "their",
+    "is", "are", "was", "were", "be", "been", "being",
+    "in", "on", "at", "of", "for", "by", "to", "from",
+    "and", "or", "but", "not", "no", "with", "about",
+    "assigned", "working", "works", "managed", "manages",
+    "currently", "recently", "active", "latest",
+})
 
-    name_patterns = [
-        r"\b(?:in|for|of|about|called|named|the)\s+([A-Z][a-zA-Z\s&\-]+?)(?:\s+(?:department|dept|team|project|product|employee|staff))?\b",
-        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+(?:department|dept|team|project|product)",
-    ]
+# Entity-type keywords that signal what the following / preceding
+# proper noun refers to.  Order matters: more-specific first.
+_ENTITY_CONTEXT_SIGNALS: List[Tuple[str, str]] = [
+    # (trigger word in question lowercase, filter_key to assign)
+    ("project",     "project_name"),
+    ("initiative",  "project_name"),
+    ("program",     "project_name"),
+    ("product",     "product_name"),
+    ("item",        "product_name"),
+    ("order",       "product_name"),   # D4: "orders for [Standing Desk]"
+    ("department",  "department_name"),
+    ("dept",        "department_name"),
+    ("team",        "department_name"),
+    ("division",    "department_name"),
+]
 
-    if "name" in filterable:
-        for pattern in name_patterns:
-            match = re.search(pattern, question)
-            if match:
-                value = match.group(1).strip()
-                if len(value) > 1 and value.lower() not in {
-                    "all", "every", "any", "the", "a", "an", "list", "show",
-                    "what", "who", "which", "how", "where", "when", "why"
-                }:
-                    return value
+# Directional preposition signals (D4/D8): only apply when the trigger
+# appears in the text BEFORE (to the left of) the candidate.
+# This prevents "in [Operations] ... project" from mapping Operations to
+# project_name — "in" fires as a department signal from the left side.
+_BEFORE_CANDIDATE_SIGNALS: List[Tuple[str, str]] = [
+    ("in",   "department_name"),   # "employees in [Sales]"
+    ("for",  "product_name"),      # "orders for [Standing Desk]"
+    ("of",   "product_name"),      # "units of [Webcam HD]"
+]
 
-    return None
+
+def _scan_proper_noun_candidates(question: str) -> List[str]:
+    """
+    Extract all Title-Case word sequences from the original question.
+
+    Works on the raw question (not lowercased) so capitalisation is
+    preserved.  Single-word stop-words are filtered out.
+    Returns longest-match candidates first.
+    """
+    # Match 1-to-4 consecutive Title-Case tokens (e.g. "Platform Migration",
+    # "Webcam HD", "Leslie Knope", "API Gateway Rebuild")
+    raw_candidates = re.findall(
+        r"\b([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*){0,3})\b",
+        question,
+    )
+
+    # Question-opener and auxiliary words that are Title-Case at sentence
+    # start but must never become entity name candidates (D3).
+    _QUESTION_STARTERS = frozenset({
+        "who", "which", "what", "how", "where", "when", "why",
+        "are", "is", "do", "does", "did", "have", "has",
+    })
+
+    seen: set = set()
+    result: List[str] = []
+    for cand in raw_candidates:
+        cand = cand.strip()
+        if cand.lower() in _NAME_NOISE:
+            continue
+        # must be at least 2 chars and contain a real letter
+        if len(cand) < 2 or not re.search(r"[a-zA-Z]", cand):
+            continue
+        # D3: reject multi-word spans where any individual word is noise,
+        # or the span opens with a question/auxiliary verb word.
+        # Single-word candidates are already filtered by _NAME_NOISE above.
+        words = cand.split()
+        if len(words) > 1:
+            if any(w.lower() in _NAME_NOISE for w in words):
+                continue
+            if words[0].lower() in _QUESTION_STARTERS:
+                continue
+        if cand not in seen:
+            seen.add(cand)
+            result.append(cand)
+
+    # Sort longest first so "Platform Migration" beats "Platform"
+    result.sort(key=len, reverse=True)
+    return result
 
 
 def _extract_named_values(question: str) -> Dict[str, Any]:
+    """
+    Contextual Proper Noun Extractor — schema-aware, case-insensitive.
+
+    Extraction pipeline
+    -------------------
+    Phase 0 — Status / category tokens (purely lexical, order-independent)
+    Phase 1 — Manager-first: detect relational keywords and lock the
+               following name as `manager_name`.  This name is then
+               EXCLUDED from all subsequent general extraction to prevent
+               manager/department collision.
+    Phase 2 — Proper noun scan: find every Title-Case sequence in the
+               original question and assign it the most appropriate filter
+               key by checking what entity-context signals surround it.
+    Phase 3 — Person possessive / "what is X's" fallback for employee names.
+    """
     filters: Dict[str, Any] = {}
+    q_lower = question.lower()
 
+    # ------------------------------------------------------------------ #
+    # Phase 0 — Status tokens (order-independent, purely lowercase scan)  #
+    # ------------------------------------------------------------------ #
     for status_word, status_val in _STATUS_MAP.items():
-        if re.search(rf"\b{re.escape(status_word)}\b", question, re.I):
-            if any(w in question.lower() for w in ["order", "orders", "purchase"]):
+        if re.search(rf"\b{re.escape(status_word)}\b", q_lower):
+            if any(w in q_lower for w in ["order", "orders", "purchase"]):
                 filters["order_status"] = status_val
-            elif any(w in question.lower() for w in ["project", "projects", "initiative"]):
+            elif any(w in q_lower for w in ["project", "projects", "initiative"]):
                 filters["project_status"] = status_val
+            # Don't break — a question can have both (rare but safe)
+
+    # Category tokens — key must match schema-derived filter key (product_category)
+    # graph_query_builder._build_filter_map generates: entity_lower + "_" + col_key
+    # Product.category -> "product_category". Using "category" would be silently dropped.
+    for cat_word, cat_val in _CATEGORY_MAP.items():
+        if re.search(rf"\b{re.escape(cat_word)}\b", q_lower):
+            filters["product_category"] = cat_val
             break
 
-    for cat_word, cat_val in _CATEGORY_MAP.items():
-        if re.search(rf"\b{re.escape(cat_word)}\b", question, re.I):
-            filters["category"] = cat_val
-            break
+    # ------------------------------------------------------------------ #
+    # Phase 1 — Manager-first relational lock                             #
+    # ------------------------------------------------------------------ #
+    locked_names: set = set()   # names claimed here are excluded from Phase 2
 
     manager_match = _MANAGER_PATTERNS.search(question)
     if manager_match:
         after_manager = question[manager_match.end():].strip()
-        name_match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", after_manager)
-        if name_match:
-            filters["manager_name"] = name_match.group(1).strip()
-
-    name_in_dept = re.search(
-        r"\b(?:in|from|of|within)\s+(?:the\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+(?:department|dept|team|division))?\s*(?:$|\?|,)",
-        question, re.I
-    )
-    if name_in_dept:
-        candidate = name_in_dept.group(1).strip()
-        if candidate.lower() not in {"all", "every", "each", "the"}:
-            if not any(w in candidate.lower() for w in ["project", "order", "product"]):
-                filters["department_name"] = candidate
-
-    project_name_match = re.search(
-        r"\b(?:project|initiative|program)\s+(?:called\s+|named\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+project)?\s*(?:$|\?|,|\.|and)",
-        question, re.I
-    )
-    if project_name_match:
-        candidate = project_name_match.group(1).strip()
-        if len(candidate) > 2:
-            filters["project_name"] = candidate
-
-    product_name_match = re.search(
-        r"\b(?:product\s+)?([A-Z][a-zA-Z\s]+\s+(?:Pro|HD|Hub|Desk|Chair|Keyboard|Monitor|Mouse|Lamp|Pack|Paper|Whiteboard)[\w\s]*)\b",
-        question
-    )
-    if product_name_match:
-        filters["product_name"] = product_name_match.group(1).strip()
-
-    person_name_match = re.search(
-        r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\'s)?\s+(?:salary|pay|role|email|department|budget|project|assigned)",
-        question
-    )
-    if person_name_match:
-        filters["employee_name"] = person_name_match.group(1).strip()
-
-    if not filters.get("employee_name"):
-        whose_match = re.search(
-            r"\bwhat\s+(?:is|are)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)(?:\'s)?\s+\w+",
-            question
+        # Allow up to 4-word proper noun after the relational keyword
+        name_match = re.search(
+            r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})", after_manager
         )
-        if whose_match:
-            candidate = whose_match.group(1).strip()
-            schema_entities = _get_valid_entities()
-            if candidate not in schema_entities:
+        if name_match:
+            mgr_name = name_match.group(1).strip()
+            if mgr_name.lower() not in _NAME_NOISE:
+                filters["manager_name"] = mgr_name
+                locked_names.add(mgr_name.lower())
+                logger.debug("Manager-first lock: manager_name=%s", mgr_name)
+
+    # ------------------------------------------------------------------ #
+    # Phase 2 — Proper noun scan with entity-context assignment           #
+    # ------------------------------------------------------------------ #
+    candidates = _scan_proper_noun_candidates(question)
+
+    # Build a small window-based context checker:
+    # For each candidate, look at the words within ±4 tokens around it
+    # in the lowercased question to decide which filter key to use.
+
+    def _context_around(needle: str, haystack_lower: str, window: int = 40) -> str:
+        idx = haystack_lower.find(needle.lower())
+        if idx == -1:
+            return ""
+        start = max(0, idx - window)
+        end = min(len(haystack_lower), idx + len(needle) + window)
+        return haystack_lower[start:end]
+
+    for cand in candidates:
+        cand_lower = cand.lower()
+
+        # Skip names already locked by Phase 1
+        if cand_lower in locked_names:
+            continue
+        # Skip single-word noise
+        if cand_lower in _NAME_NOISE:
+            continue
+        # Skip schema entity names themselves ("Employee", "Project", …)
+        if cand in _get_valid_entities():
+            continue
+        # Skip sub-spans of values already assigned in this phase.
+        # e.g. if "API Gateway Rebuild" -> project_name, skip "Gateway Rebuild"
+        # which is a subset and would incorrectly become employee_name.
+        if any(cand_lower in str(v).lower() and cand_lower != str(v).lower()
+               for v in filters.values()):
+            continue
+
+        context = _context_around(cand, q_lower)
+
+        # Determine filter key — directional check takes priority over bidirectional.
+        # Step 1: check BEFORE_CANDIDATE_SIGNALS (left-context only, 30 char window).
+        # A nearby preposition like "in [Sales]" or "for [Standing Desk]" is
+        # higher-confidence than a distant bidirectional "project" keyword that
+        # could be far from the candidate (D4/D8).
+        assigned_key: Optional[str] = None
+        idx = q_lower.find(cand_lower)
+        left_ctx = q_lower[max(0, idx - 30):idx]
+        for trigger, fkey in _BEFORE_CANDIDATE_SIGNALS:
+            if re.search(rf"\b{re.escape(trigger)}\b", left_ctx):
+                assigned_key = fkey
+                break
+
+        # Step 2: bidirectional entity-context signals (±40 chars) as fallback.
+        if assigned_key is None:
+            for trigger, fkey in _ENTITY_CONTEXT_SIGNALS:
+                if re.search(rf"\b{re.escape(trigger)}\b", context):
+                    assigned_key = fkey
+                    break
+
+        # If no entity-context signal found, fall through to person heuristic
+        if assigned_key is None:
+            # Two-word Title-Case with no entity signal → likely a person name
+            if re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+$", cand):
+                assigned_key = "employee_name"
+            else:
+                # Single capitalised word or ambiguous multi-word — skip
+                continue
+
+        # Don't overwrite an already-locked / higher-priority filter
+        if assigned_key not in filters:
+            filters[assigned_key] = cand
+            logger.debug("Proper noun assigned: %s → %s", cand, assigned_key)
+
+    # ------------------------------------------------------------------ #
+    # Phase 2.5 — Case-insensitive fallback for product & project names   #
+    # that appear lowercase in the question (e.g. "webcam hd",            #
+    # "platform migration project")                                        #
+    # ------------------------------------------------------------------ #
+    _PRODUCT_CONTEXT = {"stock", "units", "inventory", "price", "cost",
+                        "how many", "in stock", "available"}
+    _PROJECT_CONTEXT = {"project", "initiative", "assigned to", "working on",
+                        "on the", "part of"}
+
+    # Only run if we haven't already captured the value via Phase 2
+    if "product_name" not in filters:
+        if any(kw in q_lower for kw in _PRODUCT_CONTEXT):
+            # Extract any 1-3 word sequence after "of", "for", "about" or
+            # before "stock", "units", "inventory", "price" — case-insensitive
+            prod_match = re.search(
+                r"\b(?:of|for|about)\s+([a-zA-Z0-9][a-zA-Z0-9\s]{1,30}?)"
+                r"\s+(?:stock|units|inventory|price|cost|in stock|available|are|is)\b",
+                q_lower,
+            )
+            if not prod_match:
+                prod_match = re.search(
+                    r"\b([a-zA-Z0-9][a-zA-Z0-9\s]{1,30}?)\s+"
+                    r"(?:stock|units|inventory|price|cost)\b",
+                    q_lower,
+                )
+            if prod_match:
+                raw_val = prod_match.group(1).strip()
+                # Capitalise first letter of each word to match DB values
+                cap_val = " ".join(w.capitalize() for w in raw_val.split())
+                if cap_val.lower() not in _NAME_NOISE and len(cap_val) > 2:
+                    filters["product_name"] = cap_val
+                    logger.debug(
+                        "Phase 2.5 product name (case-insensitive): %s", cap_val
+                    )
+
+    if "project_name" not in filters:
+        if any(kw in q_lower for kw in _PROJECT_CONTEXT):
+            # D3b: Collect all 1–4 word spans that immediately precede "project"
+            # using finditer (to get ALL matches, not just the leftmost).  Pick
+            # the longest span whose words are all non-noise — this gives
+            # "platform migration" from "...to the platform migration project"
+            # rather than the greedy leftmost "to the platform migration".
+            _ph25_starters = frozenset({
+                "the", "a", "an", "this", "that", "some", "any", "active",
+                "all", "every", "which", "who", "what", "how", "are", "is",
+                "do", "does", "did", "have", "has", "where", "when", "why",
+            })
+            best_proj: Optional[str] = None
+            for n_extra in range(4):  # 1-word up to 4-word spans
+                pat = (
+                    r"\b([a-zA-Z][a-zA-Z0-9]*"
+                    + r"(?:\s+[a-zA-Z][a-zA-Z0-9]*)" * n_extra
+                    + r")\s+project\b"
+                )
+                for m in re.finditer(pat, q_lower):
+                    span = m.group(1).strip()
+                    words = span.split()
+                    if (len(words) <= 4
+                            and words[0].lower() not in _ph25_starters
+                            and not any(w.lower() in _NAME_NOISE for w in words)
+                            and len(span) > 3):
+                        if best_proj is None or len(span) > len(best_proj):
+                            best_proj = span
+
+            if best_proj is None:
+                # Fallback: "project [NAME]" form
+                proj_after = re.search(
+                    r"\bproject\s+([a-zA-Z][a-zA-Z\s]{2,40}?)\s*(?:$|\?|,|\.|\band\b)",
+                    q_lower,
+                )
+                if proj_after:
+                    raw_val = proj_after.group(1).strip()
+                    words = raw_val.split()
+                    if (len(words) <= 4
+                            and words[0].lower() not in _ph25_starters
+                            and not any(w.lower() in _NAME_NOISE for w in words)
+                            and len(raw_val) > 3):
+                        best_proj = raw_val
+
+            if best_proj is not None:
+                cap_val = " ".join(w.capitalize() for w in best_proj.split())
+                filters["project_name"] = cap_val
+                logger.debug("Phase 2.5 project name (case-insensitive): %s", cap_val)
+
+    # ------------------------------------------------------------------ #
+    # Phase 3 — Possessive / "what is X's" person fallback               #
+    # D2 guard: build a set of all values already assigned by Phase 2.   #
+    # If the Phase 3 candidate matches any existing filter value, it was  #
+    # already correctly classified — skip it to prevent a ghost AND-      #
+    # constraint (e.g. employee_name = "Platform Migration").             #
+    # ------------------------------------------------------------------ #
+    _captured_values = {str(v).lower() for v in filters.values()}
+
+    def _already_captured(candidate: str) -> bool:
+        """Return True if candidate is an exact match OR a sub-string of any
+        already-assigned filter value (D2 guard — prevents ghost employee_name
+        for sub-spans like 'Gateway Rebuild' ⊂ 'API Gateway Rebuild')."""
+        c = candidate.lower()
+        return c in _captured_values or any(c in val for val in _captured_values)
+
+    if "employee_name" not in filters:
+        # Pattern: "What is Sarah Connor's salary" / "Sarah Connor's pay"
+        possessive = re.search(
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\'s)?\s+"
+            r"(?:salary|pay|role|email|department|budget|project|assigned|hire)",
+            question,
+        )
+        if possessive:
+            candidate = possessive.group(1).strip()
+            if (candidate.lower() not in _NAME_NOISE
+                    and candidate not in _get_valid_entities()
+                    and not _already_captured(candidate)):  # D2 guard
+                filters["employee_name"] = candidate
+
+    if "employee_name" not in filters:
+        # Pattern: "What is/are [Name]'s ..."
+        whose = re.search(
+            r"\bwhat\s+(?:is|are)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)(?:\'s)?\s+\w+",
+            question,
+        )
+        if whose:
+            candidate = whose.group(1).strip()
+            if (candidate.lower() not in _NAME_NOISE
+                    and candidate not in _get_valid_entities()
+                    and not _already_captured(candidate)):  # D2 guard
                 filters["employee_name"] = candidate
 
     return filters
@@ -348,6 +606,25 @@ def _layer1_pattern_extraction(question: str) -> Optional[EntityExtractionResult
         )
 
     entities = _detect_entities_from_keywords(question)
+
+    # Auto-infer entity from named filter values when no keyword trigger fired.
+    # e.g. "What is Alan Turing salary?" has no 'employee/staff/who' keyword but
+    # Phase 3 extraction captures employee_name=Alan Turing — infer Employee.
+    # Similarly for product_name, department_name, project_name filters.
+    if not entities:
+        filters_early = _extract_named_values(question)
+        _FILTER_TO_ENTITY = {
+            "employee_name": "Employee",
+            "department_name": "Department",
+            "product_name": "Product",
+            "project_name": "Project",
+            "manager_name": "Employee",
+        }
+        for fkey, entity in _FILTER_TO_ENTITY.items():
+            if fkey in filters_early and entity not in entities:
+                entities.append(entity)
+                logger.debug("Entity auto-inferred from filter key %s -> %s", fkey, entity)
+
     if not entities:
         return None
 

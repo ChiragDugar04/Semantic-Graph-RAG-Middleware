@@ -49,6 +49,21 @@ class GraphQueryBuilder:
                 select_parts = [p for p in select_parts if "manager_id" not in p]
                 select_parts.append(mgr_col)
 
+        # Honour manager_join=True on any edge (e.g. Department -[managed_by]-> Employee).
+        # When this flag is set, the JOIN is on the manager FK (d.manager_id = e.id),
+        # so e.name is the manager's name — expose it as manager_name, not employee_name.
+        for step in join_chain:
+            if step.manager_join and "Project" not in path:
+                mgr_col = "e.name AS manager_name"
+                if mgr_col not in select_parts:
+                    # Replace employee_name with manager_name for this context
+                    select_parts = [
+                        mgr_col if p == "e.name AS employee_name" else p
+                        for p in select_parts
+                    ]
+                    if mgr_col not in select_parts:
+                        select_parts.append(mgr_col)
+
         where_clause, where_params = self._build_where(filters, path, joined_tables)
         order_limit = self._build_order_limit(q_type, entities, filters)
 
@@ -343,21 +358,28 @@ class GraphQueryBuilder:
             return "GROUP BY 1"
 
         if q_type == "list":
+            # D6b: Order anchor must take priority over Employee — expanded Order
+            # paths include Employee but should still sort by order date, not name.
+            if "Order" in entities:
+                return "ORDER BY o.order_date DESC LIMIT 20"
             if "Employee" in entities:
                 return "ORDER BY e.name ASC"
             if "Product" in entities:
                 return "ORDER BY p.name ASC"
-            if "Order" in entities:
-                return "ORDER BY o.order_date DESC LIMIT 20"
             if "Project" in entities:
                 return "ORDER BY proj.name ASC"
             return "ORDER BY 1 ASC"
 
         if q_type == "cross_entity":
+            if "Order" in entities:
+                return "ORDER BY o.order_date DESC LIMIT 20"
             if "Employee" in entities:
                 return "ORDER BY e.name ASC"
             return "ORDER BY 1 ASC"
 
+        # lookup / default
+        if "Order" in entities:
+            return "ORDER BY o.order_date DESC LIMIT 20"
         return "LIMIT 10"
 
     def _build_description(

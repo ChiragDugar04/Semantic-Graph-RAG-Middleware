@@ -57,6 +57,19 @@ def run_pipeline(question: str) -> MiddlewareTrace:
         logger.info("Off-topic question short-circuited at extraction stage")
         return trace
 
+    # T2: Unsupported query pattern — return helpful guidance instead of wrong SQL.
+    # The extractor sets question_type="other" with a populated escalation_reason
+    # for queries that need HAVING/subquery/temporal capabilities we don't support.
+    if (extraction.question_type == "other"
+            and extraction.escalation_reason
+            and "unsupported_pattern" in extraction.confidence_breakdown):
+        trace.final_answer = extraction.escalation_reason
+        trace.pipeline_stage_reached = "complete"
+        trace.total_latency_ms = round((time.time() - pipeline_start) * 1000, 2)
+        _populate_legacy_fields(trace, extraction, None)
+        logger.info("T2: unsupported pattern short-circuited")
+        return trace
+
     if not extraction.is_trustworthy and not extraction.entities:
         logger.warning(
             "Extraction confidence %.2f below threshold with no entities — "
@@ -349,6 +362,41 @@ def _expand_entities_from_filters(
         entity_set.add("Order")
         logger.info("Path extension: injected Order (order_status filter present)")
 
+    # N2: Employee injection for employee_name + Project path.
+    # When a question names an employee AND asks about projects
+    # (e.g. "Sarah Connor is in which project"), the system must traverse
+    # Employee→Project via project_assignments — not single-node Project.
+    # Without this rule, employee_name filter is silently dropped because
+    # it doesn't exist in _build_filter_map for a Project-only path.
+    if "employee_name" in filters and "Employee" not in entity_set and "Project" in entity_set:
+        idx = expanded.index("Project")
+        expanded.insert(idx, "Employee")
+        entity_set.add("Employee")
+        logger.info(
+            "Path extension: injected Employee before Project "
+            "(employee_name filter + Project entity — needs Employee→Project join)"
+        )
+
+    # N4: reports_to_name routing — org-chart hierarchy queries.
+    # "employees who report to X" = employees in the department managed by X.
+    # Route to Employee-only path; the reports_to_name subquery filter in
+    # _build_filter_map resolves the manager name to a department via the
+    # departments.manager_id FK — purely schema-driven, no names hardcoded.
+    if "reports_to_name" in filters:
+        if "Employee" not in entity_set:
+            expanded.append("Employee")
+            entity_set.add("Employee")
+        # Remove Project from path if it was injected by manager_name logic —
+        # reports_to is an employee hierarchy query, not a project query.
+        if "Project" in entity_set and "manager_name" not in filters:
+            expanded = [e for e in expanded if e != "Project"]
+            entity_set.discard("Project")
+            logger.info(
+                "Path extension: removed Project from path "
+                "(reports_to_name query — org-chart, not project manager)"
+            )
+        logger.info("Path extension: Employee path for reports_to_name filter")
+
     # --- Order display expansion (P1-B) ---
     # When Order is the anchor entity it owns two outgoing edges in the schema:
     #   Order -[placed_by]->  Employee  (o.employee_id = e.id)
@@ -367,32 +415,35 @@ def _expand_entities_from_filters(
                     "(Order display expansion via schema edge)", neighbour
                 )
 
-    # --- Department display expansion (P1-C / D7) ---
-    # Default: inject Employee so the Department->Employee (managed_by) JOIN
-    # is built, giving manager_name for display queries.
+    # --- Department display expansion (P1-C / D7 / R7) ---
+    # When Department is the sole entity, we must decide which edge to use:
     #
-    # D7 exception: for comparison queries (highest/lowest salary etc.) the
-    # managed_by JOIN only returns ONE employee (the manager). We need ALL
-    # employees in the department for a correct MAX/MIN.  Inject Employee
-    # first in the list so _canonical_entity_order places it before Department
-    # and the works_in edge (Employee→Department) is used instead.
+    #   Employee→Department  (works_in: e.department_id = d.id)  → ALL staff in dept
+    #   Department→Employee  (managed_by: d.manager_id = e.id)   → only the 1 manager
+    #
+    # R7: "list" queries asking for "everyone in HR" need ALL employees, not just
+    # the manager.  Inject Employee BEFORE Department for list, comparison, and
+    # cross_entity queries so _canonical_entity_order keeps Employee as anchor.
+    # Only true aggregation queries (headcount/budget breakdown) can safely use
+    # the managed_by JOIN because they GROUP BY department anyway.
     if "Department" in entity_set and "Employee" not in entity_set:
-        if q_type == "comparison":
-            # Insert Employee BEFORE Department so canonical order keeps Employee
-            # as anchor → Employee→Department path → works_in JOIN → all employees.
+        if q_type in ("comparison", "list", "cross_entity", "lookup"):
+            # Insert Employee BEFORE Department → Employee→Department path →
+            # works_in JOIN → returns all employees in the department.
             idx = expanded.index("Department")
             expanded.insert(idx, "Employee")
             entity_set.add("Employee")
             logger.info(
                 "Path extension: injected Employee before Department "
-                "(comparison query — needs all employees, not just manager)"
+                "(%s query — needs Employee→Department path for all staff)", q_type
             )
         else:
+            # aggregation: use managed_by join (one manager row) + GROUP BY dept
             expanded.append("Employee")
             entity_set.add("Employee")
             logger.info(
-                "Path extension: injected Employee "
-                "(Department display expansion — headcount/manager)"
+                "Path extension: injected Employee after Department "
+                "(aggregation — managed_by join for dept summary)"
             )
 
     return _canonical_entity_order(expanded, set(expanded), filters, original_entities=entities, q_type=q_type)

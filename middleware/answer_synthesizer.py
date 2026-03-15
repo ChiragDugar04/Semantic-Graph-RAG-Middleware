@@ -1,31 +1,15 @@
-"""
-middleware/answer_synthesizer.py
-
-Generates the final natural language answer.
-
-SPEED STRATEGY (3-tier):
-  Tier 0 — Template bypass (0ms):
-    Formats results directly in Python using the aliased column names
-    that graph_query_builder produces (employee_name, salary, etc.)
-    Handles the majority of queries with zero LLM calls.
-
-  Tier 1 — Fast LLM (qwen2.5:1.5b, ~2-5s):
-    Used only for questions where NL reasoning genuinely adds value:
-    comparisons, aggregations, yes/no questions.
-
-  Tier 2 — Fallback:
-    Returns raw formatted context if LLM fails.
-"""
-
 from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import requests
 import yaml
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
 from middleware.models import DBResult
+
+logger = logging.getLogger(__name__)
 
 
 def _load_model_config() -> dict:
@@ -34,211 +18,443 @@ def _load_model_config() -> dict:
         return yaml.safe_load(f)["models"]
 
 
-# ============================================================
-# HELPERS — column extraction with alias fallbacks
-# ============================================================
-
-def _get(row: Dict, *keys: str, default=None):
-    """Get the first matching key from a row dict."""
-    for k in keys:
-        if k in row and row[k] is not None:
-            return row[k]
-    return default
-
-
-def _fmt_currency(val) -> str:
+def _fmt_currency(val: Any) -> str:
     try:
         return f"${float(val):,.2f}"
     except (TypeError, ValueError):
         return str(val)
 
 
-def _is_comparison(q: str) -> bool:
-    keywords = [
+def _get(row: Dict, *keys: str, default=None) -> Any:
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return default
+
+
+def _needs_llm_synthesis(user_question: str, rows: List[Dict]) -> bool:
+    if not rows:
+        return False
+
+    q = user_question.lower()
+
+    comparison_keywords = [
         "highest", "lowest", "most", "least", "best", "worst", "top",
         "maximum", "minimum", "richest", "who earns", "who makes",
-        "most expensive", "cheapest", "highest paid", "lowest paid",
+        "most expensive", "cheapest", "priciest", "highest paid",
+        "lowest paid", "best paid", "rank", "compare",
     ]
-    return any(kw in q for kw in keywords)
+    aggregation_keywords = [
+        "how many", "count", "total", "average", "avg", "number of",
+        "sum of", "breakdown",
+    ]
+
+    return any(kw in q for kw in comparison_keywords + aggregation_keywords)
 
 
-def _is_aggregation(q: str) -> bool:
-    keywords = ["how many", "count", "total", "average", "avg", "number of"]
-    return any(kw in q for kw in keywords)
+def _format_single_row(row: Dict, user_question: str) -> Optional[str]:
+    q = user_question.lower()
+
+    # D6: order_id is the definitive anchor — check it before employee salary.
+    # Expanded Order rows contain employee_name+salary which would otherwise
+    # be misformatted as an employee record.
+    order_id = _get(row, "order_id")
+    if order_id is not None:
+        status = _get(row, "status", "order_status") or "unknown"
+        product = _get(row, "product_name", "product")
+        quantity = _get(row, "quantity")
+        order_date = _get(row, "order_date")
+        ordered_by = _get(row, "employee_name", "ordered_by")
+        parts = [f"Order **#{order_id}**"]
+        if product:
+            parts.append(f"for **{product}**")
+        if quantity:
+            parts.append(f"(qty: {quantity})")
+        parts.append(f"is **{status}**")
+        if order_date:
+            parts.append(f"· Placed: {order_date}")
+        if ordered_by:
+            parts.append(f"· By: {ordered_by}")
+        return " ".join(parts) + "."
+
+    name = _get(row, "employee_name", "name")
+    salary = _get(row, "salary")
+    role = _get(row, "employee_role", "role")
+    dept = _get(row, "department_name")
+    hire_date = _get(row, "hire_date")
+    email = _get(row, "email")
+
+    if name and salary is not None:
+        parts = [f"**{name}**"]
+        if role:
+            parts.append(f"({role})")
+        if dept:
+            parts.append(f"in **{dept}**")
+        parts.append(f"earns **{_fmt_currency(salary)}** per year")
+        if hire_date and "hire" in q:
+            parts.append(f"· Hired: {hire_date}")
+        if email and "email" in q:
+            parts.append(f"· Email: {email}")
+        return " ".join(parts) + "."
+
+    pname = _get(row, "product_name", "name")
+    stock = _get(row, "stock_quantity")
+    price = _get(row, "price")
+    supplier = _get(row, "supplier")
+    category = _get(row, "category")
+
+    if pname and stock is not None and "stock" in q:
+        parts = [f"There are **{stock} units** of **{pname}** in stock"]
+        if price is not None:
+            parts.append(f"priced at **{_fmt_currency(price)}**")
+        if supplier and "supplier" in q:
+            parts.append(f"· Supplier: {supplier}")
+        return " ".join(parts) + "."
+
+    if pname and price is not None and stock is None:
+        return f"**{pname}** ({category or 'Product'}) costs **{_fmt_currency(price)}**."
+
+    if pname and price is not None:
+        parts = [f"**{pname}**"]
+        if category:
+            parts.append(f"({category})")
+        parts.append(f"costs **{_fmt_currency(price)}**")
+        if stock is not None:
+            parts.append(f"· {stock} units in stock")
+        if supplier:
+            parts.append(f"· Supplier: {supplier}")
+        return " ".join(parts) + "."
+
+    dname = _get(row, "department_name")
+    budget = _get(row, "budget")
+    location = _get(row, "location")
+    headcount = _get(row, "headcount")
+    manager_name = _get(row, "manager_name")
+
+    if dname and (budget is not None or headcount is not None):
+        parts = [f"The **{dname}** department"]
+        if budget is not None:
+            parts.append(f"has a budget of **{_fmt_currency(budget)}**")
+        if headcount is not None:
+            parts.append(f"with **{headcount} employees**")
+        if manager_name:
+            parts.append(f"· Managed by: **{manager_name}**")
+        if location:
+            parts.append(f"· Location: {location}")
+        return " ".join(parts) + "."
+
+    proj_name = _get(row, "project_name")
+    proj_status = _get(row, "project_status")
+    proj_budget = _get(row, "project_budget")
+    start_date = _get(row, "start_date")
+    end_date = _get(row, "end_date")
+
+    if proj_name:
+        parts = [f"**{proj_name}**"]
+        if manager_name:
+            parts.append(f"is managed by **{manager_name}**")
+        if proj_status:
+            parts.append(f"· Status: {proj_status}")
+        if proj_budget is not None:
+            parts.append(f"· Budget: {_fmt_currency(proj_budget)}")
+        if start_date:
+            date_str = f"· {start_date}"
+            if end_date:
+                date_str += f" → {end_date}"
+            else:
+                date_str += " → ongoing"
+            parts.append(date_str)
+        return " ".join(parts) + "."
+
+    order_id = _get(row, "order_id", "id")
+    status = _get(row, "status", "order_status")
+    product = _get(row, "product")
+    quantity = _get(row, "quantity")
+    order_date = _get(row, "order_date")
+    ordered_by = _get(row, "ordered_by")
+
+    if order_id and status:
+        parts = [f"Order **#{order_id}**"]
+        if product:
+            parts.append(f"for **{product}**")
+        if quantity:
+            parts.append(f"(qty: {quantity})")
+        parts.append(f"is **{status}**")
+        if order_date:
+            parts.append(f"· Placed: {order_date}")
+        if ordered_by:
+            parts.append(f"· By: {ordered_by}")
+        return " ".join(parts) + "."
+
+    return None
 
 
-# ============================================================
-# TIER 0 — TEMPLATE BYPASS (pure Python, 0ms)
-# ============================================================
+def _format_employee_list(rows: List[Dict], user_question: str) -> str:
+    q = user_question.lower()
+
+    # ------------------------------------------------------------------ #
+    # Deduplication: collapse multiple rows for the same employee into    #
+    # one entry, collecting all project assignments into a single line.   #
+    # ------------------------------------------------------------------ #
+    # Key = (employee_name, role, salary, department)
+    # Value = list of (project_name, assignment_role) tuples
+    seen_employees: Dict[str, Dict] = {}   # name → merged row
+    project_map: Dict[str, List[str]] = {} # name → [proj assignment strings]
+
+    for row in rows:
+        name = _get(row, "employee_name", "name") or "Unknown"
+        proj = _get(row, "project_name")
+        asgn = _get(row, "assignment_role")
+
+        if name not in seen_employees:
+            seen_employees[name] = row
+            project_map[name] = []
+
+        if proj:
+            proj_str = proj
+            if asgn:
+                proj_str += f" [{asgn}]"
+            if proj_str not in project_map[name]:
+                project_map[name].append(proj_str)
+
+    lines = []
+    for i, (name, row) in enumerate(seen_employees.items(), 1):
+        role = _get(row, "employee_role", "role")
+        salary = _get(row, "salary")
+        dept = _get(row, "department_name")
+        hire_date = _get(row, "hire_date")
+
+        parts = [f"**{name}**"]
+        if role:
+            parts.append(f"({role})")
+        if dept and "department" not in q.split("in ")[-1][:20]:
+            parts.append(f"— {dept}")
+
+        # Render all projects on one line, comma-separated
+        if project_map[name]:
+            parts.append(f"→ {', '.join(project_map[name])}")
+
+        if salary is not None:
+            parts.append(f"— {_fmt_currency(salary)}")
+        if hire_date and "hire" in q:
+            parts.append(f"· Hired: {hire_date}")
+
+        lines.append(f"{i}. {' '.join(parts)}")
+
+    count = len(seen_employees)
+    noun = "employee" if count == 1 else "employees"
+    return f"Found **{count} {noun}**:\n\n" + "\n".join(lines)
+
+
+def _format_product_list(rows: List[Dict]) -> str:
+    lines = []
+    for i, row in enumerate(rows, 1):
+        name = _get(row, "product_name", "name") or "Unknown"
+        price = _get(row, "price")
+        stock = _get(row, "stock_quantity")
+        cat = _get(row, "category")
+        supplier = _get(row, "supplier")
+
+        parts = [f"**{name}**"]
+        if cat:
+            parts.append(f"({cat})")
+        if price is not None:
+            parts.append(f"— {_fmt_currency(price)}")
+        if stock is not None:
+            parts.append(f"· {stock} in stock")
+        if supplier:
+            parts.append(f"· {supplier}")
+
+        lines.append(f"{i}. {' '.join(parts)}")
+
+    return f"Found **{len(rows)} products**:\n\n" + "\n".join(lines)
+
+
+def _format_department_list(rows: List[Dict]) -> str:
+    lines = []
+    for i, row in enumerate(rows, 1):
+        name = _get(row, "department_name", "name") or "Unknown"
+        budget = _get(row, "budget")
+        headcount = _get(row, "headcount")
+        location = _get(row, "location")
+        manager_name = _get(row, "manager_name")
+
+        parts = [f"**{name}**"]
+        if budget is not None:
+            parts.append(f"— {_fmt_currency(budget)}")
+        if headcount is not None:
+            parts.append(f"· {headcount} employees")
+        if manager_name:
+            parts.append(f"· Mgr: {manager_name}")
+        if location:
+            parts.append(f"· {location}")
+
+        lines.append(f"{i}. {' '.join(parts)}")
+
+    return f"Found **{len(rows)} departments**:\n\n" + "\n".join(lines)
+
+
+def _format_order_list(rows: List[Dict]) -> str:
+    lines = []
+    for i, row in enumerate(rows, 1):
+        oid = _get(row, "order_id", "id") or i
+        # D6: expanded Order path produces 'product_name' and 'employee_name'
+        # (not 'product' / 'ordered_by' which were the old intents.yaml aliases)
+        product = _get(row, "product_name", "product")
+        quantity = _get(row, "quantity")
+        status = _get(row, "status", "order_status") or "unknown"
+        date = _get(row, "order_date")
+        ordered_by = _get(row, "employee_name", "ordered_by")
+
+        parts = [f"Order **#{oid}**"]
+        if product:
+            parts.append(f"— {product}")
+        if quantity:
+            parts.append(f"(qty: {quantity})")
+        parts.append(f"**{status}**")
+        if date:
+            parts.append(f"· {date}")
+        if ordered_by:
+            parts.append(f"· {ordered_by}")
+
+        lines.append(f"{i}. {' '.join(parts)}")
+
+    return f"Found **{len(rows)} orders**:\n\n" + "\n".join(lines)
+
+
+def _format_project_list(rows: List[Dict]) -> str:
+    lines = []
+    for i, row in enumerate(rows, 1):
+        name = _get(row, "project_name") or "Unknown"
+        mgr = _get(row, "manager_name")
+        status = _get(row, "project_status")
+        budget = _get(row, "project_budget")
+        start = _get(row, "start_date")
+        end = _get(row, "end_date")
+
+        parts = [f"**{name}**"]
+        if mgr:
+            parts.append(f"(by {mgr})")
+        if status:
+            parts.append(f"· {status}")
+        if budget is not None:
+            parts.append(f"· {_fmt_currency(budget)}")
+        if start:
+            date_str = f"· {start}"
+            if end:
+                date_str += f" → {end}"
+            else:
+                date_str += " → ongoing"
+            parts.append(date_str)
+
+        lines.append(f"{i}. {' '.join(parts)}")
+
+    count = len(rows)
+    noun = "project" if count == 1 else "projects"
+    return f"Found **{count} {noun}**:\n\n" + "\n".join(lines)
+
 
 def _try_template_answer(
     user_question: str,
     db_result: DBResult,
 ) -> Optional[str]:
-    """
-    Format the answer directly from structured DB rows.
-    Returns None to fall through to LLM for complex reasoning.
-
-    Handles graph_query_builder aliased columns:
-      employee_name, employee_role, salary, department_name,
-      project_name, assignment_role, product_name, price, etc.
-    """
     rows = db_result.rows
     if not rows:
         return None
 
-    q = user_question.lower()
-
-    # Skip template for queries that need ranking/comparison/aggregation
-    if _is_comparison(q) or _is_aggregation(q):
+    if _needs_llm_synthesis(user_question, rows):
         return None
 
-    # ── Single row lookup ─────────────────────────────────────
     if len(rows) == 1:
-        row = rows[0]
+        formatted = _format_single_row(rows[0], user_question)
+        if formatted:
+            return formatted
 
-        # Salary lookup: "what is X's salary"
-        name   = _get(row, "employee_name", "name")
-        salary = _get(row, "salary")
-        role   = _get(row, "employee_role", "role")
-        if name and salary is not None:
-            role_str = f", {role}" if role else ""
-            dept = _get(row, "department_name")
-            dept_str = f" ({dept})" if dept else ""
-            return f"**{name}**{role_str}{dept_str} earns **{_fmt_currency(salary)}** per year."
+    row_keys = set(rows[0].keys())
 
-        # Stock quantity
-        pname = _get(row, "product_name", "name")
-        stock = _get(row, "stock_quantity")
-        if pname and stock is not None:
-            return f"There are **{stock} units** of {pname} in stock."
+    # D6: order_id is a definitive discriminant — check it FIRST.
+    # Expanded Order queries (path=[Order, Employee, Product]) include employee_name
+    # and salary columns, which would otherwise trigger has_employee and return
+    # "Found N employees" instead of "Found N orders".
+    has_order = (
+        ("status" in row_keys or "order_status" in row_keys)
+        and "order_id" in row_keys
+    )
+    has_employee = "employee_name" in row_keys or (
+        "name" in row_keys and "salary" in row_keys
+    )
+    has_product = "product_name" in row_keys or (
+        "name" in row_keys and "price" in row_keys
+    )
+    has_department = "department_name" in row_keys or (
+        "name" in row_keys and "budget" in row_keys
+    )
+    has_project = "project_name" in row_keys and "employee_name" not in row_keys
 
-        # Department budget
-        dname  = _get(row, "department_name", "name")
-        budget = _get(row, "budget")
-        if dname and budget is not None and "budget" in q:
-            return f"The **{dname}** department has a budget of **{_fmt_currency(budget)}**."
+    if has_order:
+        return _format_order_list(rows)
 
-        # Single product price
-        price = _get(row, "price")
-        if pname and price is not None:
-            return f"**{pname}** costs **{_fmt_currency(price)}**."
+    if has_employee:
+        return _format_employee_list(rows, user_question)
 
-        return None  # Unknown single-row shape — use LLM
+    if has_product:
+        return _format_product_list(rows)
 
-    # ── Multi-row results ─────────────────────────────────────
-    rows_keys = set(rows[0].keys())
+    if has_department:
+        return _format_department_list(rows)
 
-    # ── Employee list (with optional salary / dept / project) ─
-    has_emp_name = "employee_name" in rows_keys or "name" in rows_keys
-    if has_emp_name:
-        lines = []
-        for i, row in enumerate(rows, 1):
-            name   = _get(row, "employee_name", "name") or "Unknown"
-            role   = _get(row, "employee_role", "role")
-            salary = _get(row, "salary")
-            dept   = _get(row, "department_name")
-            proj   = _get(row, "project_name")
-            asgn   = _get(row, "assignment_role")
+    if has_project:
+        return _format_project_list(rows)
 
-            parts = [f"**{name}**"]
-            if role:
-                parts.append(f"({role})")
-            if dept and dept.lower() not in q:  # skip dept if already in question
-                parts.append(f"— {dept}")
-            if proj:
-                parts.append(f"— {proj}")
-            if asgn:
-                parts.append(f"[{asgn}]")
-            if salary is not None:
-                parts.append(f"— {_fmt_currency(salary)}")
+    if has_order:
+        return _format_order_list(rows)
 
-            lines.append(f"{i}. {' '.join(parts)}")
+    lines = []
+    for i, row in enumerate(rows, 1):
+        parts = [f"{k.replace('_', ' ').title()}: {v}" for k, v in row.items() if v is not None]
+        lines.append(f"{i}. {' | '.join(parts)}")
 
-        count = len(rows)
-        noun  = "employee" if count == 1 else "employees"
-        return f"Found **{count} {noun}**:\n\n" + "\n".join(lines)
+    return f"Found **{len(rows)} records**:\n\n" + "\n".join(lines)
 
-    # ── Product list ───────────────────────────────────────────
-    if "product_name" in rows_keys or ("name" in rows_keys and "price" in rows_keys):
-        lines = []
-        for i, row in enumerate(rows, 1):
-            name  = _get(row, "product_name", "name") or "Unknown"
-            price = _get(row, "price")
-            stock = _get(row, "stock_quantity")
-            cat   = _get(row, "category")
-            parts = [f"**{name}**"]
-            if cat:
-                parts.append(f"({cat})")
-            if price is not None:
-                parts.append(f"— {_fmt_currency(price)}")
-            if stock is not None:
-                parts.append(f"· {stock} in stock")
-            lines.append(f"{i}. {' '.join(parts)}")
-        return f"Found **{len(rows)} products**:\n\n" + "\n".join(lines)
-
-    # ── Order list ─────────────────────────────────────────────
-    if "status" in rows_keys and any(kw in q for kw in ["order", "orders", "purchase"]):
-        lines = []
-        for i, row in enumerate(rows, 1):
-            status = _get(row, "status", "order_status") or "unknown"
-            oid    = _get(row, "order_id", "id") or i
-            total  = _get(row, "total_amount")
-            date   = _get(row, "order_date")
-            parts  = [f"Order #{oid}", f"**{status}**"]
-            if total:
-                parts.append(f"— {_fmt_currency(total)}")
-            if date:
-                parts.append(f"({date})")
-            lines.append(f"{i}. {' '.join(parts)}")
-        return f"Found **{len(rows)} orders**:\n\n" + "\n".join(lines)
-
-    return None  # Unknown shape — fall through to LLM
-
-
-# ============================================================
-# TIER 1 — FAST LLM
-# ============================================================
 
 def _llm_synthesize(user_question: str, context: str, model_cfg: dict) -> str:
-    synthesis_model = model_cfg["synthesis_model"]
-    base_url        = model_cfg["ollama_base_url"]
-    temperature     = model_cfg.get("synthesis_temperature", 0.1)
-    max_tokens      = model_cfg.get("max_tokens_synthesis", 200)
-
     prompt = (
-        "You are a data assistant. Answer concisely using ONLY the data below.\n"
-        "Rules: use bullet points for lists, format currency as $X,XXX.XX, "
-        "never say 'database' or 'records'.\n\n"
+        "You are a concise data analyst. Answer the question using ONLY the data provided below.\n"
+        "Rules:\n"
+        "- Use bullet points for lists\n"
+        "- Format currency as $X,XXX.XX\n"
+        "- Be specific and direct\n"
+        "- Never say 'database' or 'records' or 'query'\n"
+        "- If comparing, clearly state who/what is highest/lowest\n\n"
         f"{context}\n\n"
-        f"Question: {user_question}\nAnswer:"
+        f"Question: {user_question}\n"
+        "Answer:"
     )
 
     try:
         resp = requests.post(
-            f"{base_url}/api/generate",
+            f"{model_cfg['ollama_base_url']}/api/generate",
             json={
-                "model": synthesis_model,
+                "model": model_cfg["synthesis_model"],
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": temperature,
-                    "num_predict": max_tokens,
+                    "temperature": 0.1,
+                    "num_predict": 300,
                     "num_ctx": 2048,
                 },
             },
-            timeout=60,
+            timeout=120,
         )
         resp.raise_for_status()
         answer = resp.json().get("response", "").strip()
+        logger.info("LLM synthesis completed (%d chars)", len(answer))
         return answer if answer else context
-    except requests.RequestException:
+
+    except requests.RequestException as exc:
+        logger.warning("LLM synthesis failed: %s — falling back to raw context", exc)
         return context
 
-
-# ============================================================
-# PUBLIC API
-# ============================================================
 
 def synthesize_answer(
     user_question: str,
@@ -246,19 +462,23 @@ def synthesize_answer(
     db_result: DBResult,
 ) -> str:
     if db_result.self_healing_triggered:
-        return context
+        if db_result.rows and "healing_message" in db_result.rows[0]:
+            return db_result.rows[0]["healing_message"]
+        return (
+            "I couldn't find any matching data for that question. "
+            "Please check your search terms and try again."
+        )
 
     if db_result.row_count == 0:
         return (
             "I couldn't find any matching data for that question. "
-            "Try rephrasing or check that the name/department/project is correct."
+            "Try rephrasing or verify the name, department, or product is correct."
         )
 
-    # Tier 0: pure Python formatting — covers most queries instantly
     template_answer = _try_template_answer(user_question, db_result)
     if template_answer:
         return template_answer
 
-    # Tier 1: LLM for comparisons, aggregations, complex reasoning
+    logger.info("Falling through to LLM synthesis for comparison/aggregation query")
     model_cfg = _load_model_config()
     return _llm_synthesize(user_question, context, model_cfg)

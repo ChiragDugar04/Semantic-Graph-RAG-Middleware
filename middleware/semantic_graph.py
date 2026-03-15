@@ -229,6 +229,7 @@ class SemanticGraph:
         if len(path) < 2:
             return []
 
+        anchor = path[0]
         chain: List[JoinStep] = []
         for i in range(len(path) - 1):
             from_node = path[i]
@@ -239,6 +240,14 @@ class SemanticGraph:
             elif self._graph.has_edge(to_node, from_node):
                 edge_data = dict(self._graph[to_node][from_node])
                 edge_data["from_node"] = from_node
+                edge_data["to_node"] = to_node
+            elif self._graph.has_edge(anchor, to_node):
+                # Fan-out topology: no direct edge from_node→to_node, but the
+                # path anchor has a direct edge to to_node (e.g. Order→Product
+                # when path is [Order, Employee, Product]).  Use the anchor's
+                # edge so both JOINs reference the same root table.
+                edge_data = dict(self._graph[anchor][to_node])
+                edge_data["from_node"] = anchor
                 edge_data["to_node"] = to_node
             else:
                 raise NoPathError(f"No edge between '{from_node}' and '{to_node}'")

@@ -273,6 +273,26 @@ class GraphQueryBuilder:
                 "param_key": "department_name",
             }
 
+        # N4: reports_to_name — org-chart hierarchy filter.
+        # "employees who report to Linus Torvalds" means: employees whose
+        # department is managed by Linus Torvalds.
+        # Schema-driven: departments.manager_id FK → employees.id
+        # Subquery: e.department_id = (SELECT d.id FROM departments d
+        #           INNER JOIN employees mgr ON d.manager_id = mgr.id
+        #           WHERE mgr.name LIKE '%Linus Torvalds%')
+        # This is purely structural — no names hardcoded anywhere.
+        if "Employee" in path:
+            fmap["reports_to_name"] = {
+                "sql": (
+                    "e.department_id IN ("
+                    "SELECT d.id FROM departments d "
+                    "INNER JOIN employees mgr ON d.manager_id = mgr.id "
+                    "WHERE mgr.name LIKE %(reports_to_name)s)"
+                ),
+                "match": "subquery",
+                "param_key": "reports_to_name",
+            }
+
         return fmap
 
     def _build_where(

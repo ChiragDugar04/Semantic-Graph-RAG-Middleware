@@ -227,9 +227,9 @@ edges:
   - from_node: Project
     to_node: Employee
     relation: managed_by_employee
-    join_type: INNER
-    join_condition: "proj.manager_id = e.id"
-    notes: "A project has one manager (an employee)"
+    join_type: LEFT
+    join_condition: "proj.manager_id = mgr.id"
+    notes: "A project has one manager (an employee). Uses alias 'mgr' to avoid collision with Employee alias 'e' when both tables are joined. pipeline.py and graph_query_builder.py inject this as: LEFT JOIN employees mgr ON mgr.id = proj.manager_id"
 
   - from_node: Project
     to_node: Department

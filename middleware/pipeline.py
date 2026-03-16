@@ -93,13 +93,26 @@ def run_pipeline(question: str) -> MiddlewareTrace:
     # fire aggregation from "how many" / "total" keywords, but the user
     # named a specific entity — they want its attributes, not a COUNT(*).
     # Downgrade to lookup so _build_select returns real columns, not COUNT(*).
-    # P2 FIX: also include product_supplier and product_category — a question like
-    # "total value of stock supplied by TechSupply Co" fires aggregation from "total"
-    # but the user wants a product list filtered by supplier, not a COUNT(*).
-    _NAMED_FILTERS = {
-        "product_name", "employee_name", "project_name", "department_name",
-        "product_supplier", "product_category",  # P2: named product scope filters
-    }
+    #
+    # T2-B: _NAMED_FILTERS is now built dynamically from graph_schema.yaml.
+    # Any filterable_column with is_named_scope: true contributes its filter
+    # key (<entity_lower>_<col_key>) to the set. Adding a new named-scope
+    # filter to the schema (e.g. supplier_country) automatically includes it
+    # here — no Python change required.
+    # Non-schema supplement keys (manager_name, reports_to_name) are added
+    # explicitly — they have no filterable_columns entry.
+    # Access schema via the module-level _graph instance (already loaded,
+    # no new import or cache needed). _graph._nodes is identical to
+    # _load_schema()["nodes"] — same YAML, same cache lifecycle.
+    _NAMED_FILTERS: set = set()
+    for _ns_entity, _ns_node in _graph._nodes.items():
+        _ns_entity_lower = _ns_entity.lower()
+        for _ns_col_key, _ns_col_meta in _ns_node.get("filterable_columns", {}).items():
+            if _ns_col_meta.get("is_named_scope"):
+                _NAMED_FILTERS.add(f"{_ns_entity_lower}_{_ns_col_key}")
+    # Non-schema named-scope supplement keys
+    _NAMED_FILTERS.update({"manager_name", "reports_to_name"})
+
     if (extraction.question_type == "aggregation"
             and _NAMED_FILTERS & set(extraction.filters.keys())):
         logger.info(
@@ -303,23 +316,77 @@ def _expand_entities_from_filters(
     list, automatically inject that entity so the graph traversal builds the
     correct JOIN path.
 
-    Rules (order matters — evaluated top-to-bottom):
-    - `department_name` filter present but no Department entity
-      → inject Department between Employee and Project (if Project present)
-        or after Employee (if no Project)
-    - `manager_name` filter present but no Project entity
-      → inject Project (manager context only makes sense via projects)
-    - `project_name` / `project_status` filter present but no Project entity
-      → inject Project
-    - `product_name` / `category` filter present but no Product entity
-      → inject Product
-    - `order_status` filter present but no Order entity
-      → inject Order
+    T2-A: A generic loop now handles all filter keys that follow the
+    <entity_lower>_<col_key> convention — these are injected automatically
+    at the end of the path (lowest priority) without any Python rule.
+    Semantic rules that require specific insertion positions or involve
+    non-schema filter keys (manager_name, reports_to_name) are kept below.
+
+    Generic injection (this loop — no Python change needed for new entities):
+    - Any filter key matching <entity_lower>_<col_key> where entity is in
+      the schema → inject that entity if absent (appended at end)
+
+    Semantic rules (explicit Python — ordering or non-schema keys):
+    - department_name → inject Department at specific position after Employee
+    - manager_name → inject Project (non-schema key, cannot be derived generically)
+    - employee_name + Project → inject Employee BEFORE Project (N2 position rule)
+    - reports_to_name → ensure Employee, remove Project if injected (N4 org-chart)
+    - Order display expansion → inject Order successors from schema graph
+    - Department display expansion → inject Employee before/after Department
     """
     expanded = list(dict.fromkeys(entities))   # deduplicate, preserve order
     entity_set = set(expanded)
 
-    # --- Department injection ---
+    # ------------------------------------------------------------------ #
+    # T2-A: Generic filter-to-entity injection loop                       #
+    # Derives entity ownership from filter key prefix using the schema    #
+    # node list. For any key "entity_lower_colname" where entity_lower    #
+    # matches a known node, inject that entity if it is not yet in path.  #
+    # Entities are appended at the end — semantic rules below handle      #
+    # cases that require specific insertion positions.                     #
+    # ------------------------------------------------------------------ #
+    _schema_node_names = list(_graph._schema_node_names)  # ordered list from schema
+    _entity_lower_map = {e.lower(): e for e in _schema_node_names}
+
+    for filter_key in filters:
+        # Match the longest entity prefix (e.g. "order" before "order_date"
+        # is ambiguous — we check all nodes and take the first prefix match).
+        matched_entity = None
+        for entity_lower, entity in _entity_lower_map.items():
+            if filter_key.startswith(entity_lower + "_") or filter_key == entity_lower:
+                matched_entity = entity
+                break
+        if matched_entity is None:
+            continue
+        if matched_entity in entity_set:
+            continue
+        # N2 guard: if employee_name filter is present AND Project is already in
+        # the path, do NOT inject Employee here — the N2 semantic rule below
+        # must handle this case because it inserts Employee BEFORE Project.
+        # A generic append would produce [Project, Employee] — wrong JOIN direction.
+        if filter_key == "employee_name" and "Project" in entity_set:
+            continue
+        # T1.6: Department + Order path guard.
+        # When BOTH department_name and order_status are in filters, injecting
+        # Department creates a traversal the graph cannot resolve (no Dept→Order edge).
+        # The correct path is Order→Employee, with department_name resolved via the
+        # Employee node's filter_supplements.department_name subquery — which fires
+        # automatically when Department is NOT in the path.
+        # Guard fires ONLY when Order is already present; safe for all Order-free queries.
+        if matched_entity == "Department" and "Order" in entity_set:
+            logger.info(
+                "Path extension: skipping Department injection "
+                "(Order in path — department_name will be resolved via Employee subquery)"
+            )
+            continue
+        expanded.append(matched_entity)
+        entity_set.add(matched_entity)
+        logger.info(
+            "Path extension: injected %s generically (filter key %s)",
+            matched_entity, filter_key,
+        )
+
+    # --- Department injection (Semantic — positional: after Employee) ---
     if "department_name" in filters and "Department" not in entity_set:
         if "Employee" in entity_set:
             if "Project" in entity_set:
@@ -336,7 +403,7 @@ def _expand_entities_from_filters(
                 "Path extension: injected Department (department_name filter present)"
             )
 
-    # --- Project injection from manager_name ---
+    # --- Project injection from manager_name (Semantic — non-schema key) ---
     if "manager_name" in filters and "Project" not in entity_set:
         if "Employee" in entity_set:
             expanded.append("Project")
@@ -344,29 +411,6 @@ def _expand_entities_from_filters(
             logger.info(
                 "Path extension: injected Project (manager_name filter present)"
             )
-
-    # --- Project injection from project filters ---
-    for fk in ("project_name", "project_status"):
-        if fk in filters and "Project" not in entity_set:
-            if "Employee" in entity_set:
-                expanded.append("Project")
-                entity_set.add("Project")
-                logger.info(
-                    "Path extension: injected Project (%s filter present)", fk
-                )
-            break
-
-    # --- Product injection ---
-    if "product_name" in filters and "Product" not in entity_set:
-        expanded.append("Product")
-        entity_set.add("Product")
-        logger.info("Path extension: injected Product (product_name filter present)")
-
-    # --- Order injection ---
-    if "order_status" in filters and "Order" not in entity_set:
-        expanded.append("Order")
-        entity_set.add("Order")
-        logger.info("Path extension: injected Order (order_status filter present)")
 
     # N2: Employee injection for employee_name + Project path.
     # When a question names an employee AND asks about projects

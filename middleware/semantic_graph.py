@@ -33,6 +33,8 @@ class JoinStep:
         self.junction_alias: Optional[str] = edge_data.get("junction_alias")
         self.extra_select: List[str] = edge_data.get("extra_select", [])
         self.manager_join: bool = edge_data.get("manager_join", False)
+        # T1-D: edge-level cross-table filter supplements (dict of filter_key → {sql, match})
+        self.filter_supplements: Dict[str, Any] = edge_data.get("filter_supplements", {})
 
     def __repr__(self) -> str:
         return (
@@ -124,6 +126,13 @@ class SemanticGraph:
     @property
     def node_names(self) -> List[str]:
         return list(self._graph.nodes())
+
+    @property
+    def _schema_node_names(self) -> List[str]:
+        # T2-A: returns nodes in YAML insertion order (Python 3.7+ dict order),
+        # which is the detection priority order. Used by _expand_entities_from_filters
+        # generic loop to build the entity_lower→entity prefix map.
+        return list(self._nodes.keys())
 
     def get_node_data(self, entity: str) -> Dict[str, Any]:
         if entity not in self._graph:

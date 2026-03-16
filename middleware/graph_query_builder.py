@@ -64,7 +64,7 @@ class GraphQueryBuilder:
                     if mgr_col not in select_parts:
                         select_parts.append(mgr_col)
 
-        where_clause, where_params = self._build_where(filters, path, joined_tables)
+        where_clause, where_params = self._build_where(filters, path, joined_tables, join_chain)
         order_limit = self._build_order_limit(q_type, entities, filters)
 
         sql_parts = [f"SELECT DISTINCT {', '.join(select_parts)}", from_clause]
@@ -199,7 +199,11 @@ class GraphQueryBuilder:
 
         return joins
 
-    def _build_filter_map(self, path: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _build_filter_map(
+        self,
+        path: List[str],
+        join_chain: Optional[List["JoinStep"]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Build a dynamic filter-key → SQL mapping by reading filterable_columns
         from the schema for every node in the current path.
@@ -217,11 +221,18 @@ class GraphQueryBuilder:
         The key naming convention is:  <entity_lower>_<column>
         with a special alias for "name" columns → <entity_lower>_name.
 
-        Cross-table lookups (manager_name, project_department) are added
-        as a fixed supplement — they can't live in filterable_columns because
-        they span two tables.
+        T1-D: Cross-table supplement filters are now read from graph_schema.yaml:
+          - Node-level filter_supplements: apply whenever that node is in path.
+            Each entry may carry exclude_when_node_in_path to suppress itself
+            when a more specific node is already present (e.g. department_name
+            subquery suppressed when Department node is in path because
+            Department.filterable_columns.name already generates that key).
+          - Edge-level filter_supplements on JoinStep: apply when that edge
+            was traversed (i.e. the edge appears in join_chain).
         """
         fmap: Dict[str, Dict[str, Any]] = {}
+        if join_chain is None:
+            join_chain = []
 
         for entity in path:
             try:
@@ -243,55 +254,27 @@ class GraphQueryBuilder:
                     "param_key": filter_key,
                 }
 
-        # ---------------------------------------------------------------- #
-        # Supplement: cross-table lookups that are not in filterable_cols  #
-        # ---------------------------------------------------------------- #
-        if "Project" in path:
-            fmap["manager_name"] = {
-                "sql": "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)",
-                "match": "subquery",
-                "param_key": "manager_name",
-            }
-            fmap["project_department"] = {
-                "sql": "proj.department_id IN (SELECT id FROM departments WHERE name LIKE %(project_department)s)",
-                "match": "subquery",
-                "param_key": "project_department",
-            }
+            # T1-D: node-level filter_supplements — apply when this node is in path,
+            # subject to exclude_when_node_in_path suppression.
+            path_set = set(path)
+            for supp_key, supp_meta in node.get("filter_supplements", {}).items():
+                excluded_nodes = supp_meta.get("exclude_when_node_in_path", [])
+                if any(n in path_set for n in excluded_nodes):
+                    continue  # more specific node is present — its filterable_column handles this key
+                fmap[supp_key] = {
+                    "sql": supp_meta["sql"],
+                    "match": supp_meta["match"],
+                    "param_key": supp_key,
+                }
 
-        if "Order" in path:
-            fmap["order_status"] = {
-                "sql": "o.status",
-                "match": "exact",
-                "param_key": "order_status",
-            }
-
-        # department_name via Employee subquery (when Department not in path)
-        if "Employee" in path and "Department" not in path:
-            fmap["department_name"] = {
-                "sql": "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)",
-                "match": "subquery",
-                "param_key": "department_name",
-            }
-
-        # N4: reports_to_name — org-chart hierarchy filter.
-        # "employees who report to Linus Torvalds" means: employees whose
-        # department is managed by Linus Torvalds.
-        # Schema-driven: departments.manager_id FK → employees.id
-        # Subquery: e.department_id = (SELECT d.id FROM departments d
-        #           INNER JOIN employees mgr ON d.manager_id = mgr.id
-        #           WHERE mgr.name LIKE '%Linus Torvalds%')
-        # This is purely structural — no names hardcoded anywhere.
-        if "Employee" in path:
-            fmap["reports_to_name"] = {
-                "sql": (
-                    "e.department_id IN ("
-                    "SELECT d.id FROM departments d "
-                    "INNER JOIN employees mgr ON d.manager_id = mgr.id "
-                    "WHERE mgr.name LIKE %(reports_to_name)s)"
-                ),
-                "match": "subquery",
-                "param_key": "reports_to_name",
-            }
+        # T1-D: edge-level filter_supplements — apply when that edge was traversed.
+        for step in join_chain:
+            for supp_key, supp_meta in step.filter_supplements.items():
+                fmap[supp_key] = {
+                    "sql": supp_meta["sql"],
+                    "match": supp_meta["match"],
+                    "param_key": supp_key,
+                }
 
         return fmap
 
@@ -300,6 +283,7 @@ class GraphQueryBuilder:
         filters: Dict[str, Any],
         path: List[str],
         joined_tables: Set[str],
+        join_chain: Optional[List[JoinStep]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Schema-driven WHERE builder.
@@ -308,11 +292,13 @@ class GraphQueryBuilder:
         dynamic filter map built from graph_schema.yaml.  No hardcoded
         elif chains — adding a new filterable_column to the schema is
         sufficient to make it filterable here automatically.
+        T1-D: join_chain passed through so _build_filter_map can read
+        edge-level filter_supplements.
         """
         conditions: List[str] = []
         params: Dict[str, Any] = {}
 
-        fmap = self._build_filter_map(path)
+        fmap = self._build_filter_map(path, join_chain)
 
         for filter_key, filter_value in filters.items():
             if not filter_value:
@@ -320,7 +306,7 @@ class GraphQueryBuilder:
             filter_value = str(filter_value)
 
             if filter_key not in fmap:
-                logger.debug(
+                logger.warning(
                     "Filter key '%s' not in schema filter map for path %s — skipped",
                     filter_key, path,
                 )

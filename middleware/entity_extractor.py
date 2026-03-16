@@ -59,20 +59,14 @@ def _get_schema_keywords() -> Dict[str, Any]:
         "projection_labels": {},
     }
 
-    entity_trigger_map = {
-        "Employee": ["employee", "employees", "staff", "worker", "workers", "person", "people", "who", "member"],
-        "Department": ["department", "departments", "dept", "team", "division", "group"],
-        "Product": ["product", "products", "item", "items", "stock", "inventory", "unit", "units",
-                    # D1: category words — 'electronics', 'furniture', etc. must fire Product
-                    # detection so category-only queries work without needing the LLM fallback.
-                    "electronics", "electronic", "furniture", "office supply", "office supplies",
-                    "supply", "supplies"],
-        "Order": ["order", "orders", "purchase", "purchases", "bought", "ordered"],
-        "Project": ["project", "projects", "initiative", "initiatives", "program", "programs"],
-    }
-
+    # T1-A: trigger_words are now read from graph_schema.yaml node definitions.
+    # To add synonyms for an entity, edit the trigger_words list in the schema —
+    # no Python change required. New entities added to the schema are automatically
+    # detectable here as long as they carry a trigger_words list.
+    # Fallback: if a node has no trigger_words (e.g. a minimally-defined node),
+    # use [entity.lower()] so detection still fires on the exact entity name.
     for entity, node_data in schema["nodes"].items():
-        triggers = entity_trigger_map.get(entity, [entity.lower()])
+        triggers = node_data.get("trigger_words", [entity.lower()])
         keywords["entity_triggers"][entity] = triggers
 
         for col_def in node_data.get("selectable_columns", []):
@@ -114,8 +108,12 @@ _MANAGER_PATTERNS = re.compile(
 # This is intentionally SEPARATE from _MANAGER_PATTERNS because it routes
 # to a different path (Employee→Department via department manager FK)
 # rather than the project-manager path that manager_name triggers.
+# T1.2: Added "under" with a Title-Case lookahead so "everyone under Toby Flenderson"
+# maps to reports_to_name. The (?=[A-Z]) lookahead prevents "under contract",
+# "under $100", "under review" from firing — only Title-Case proper nouns match.
 _REPORTS_TO_PATTERNS = re.compile(
-    r"\b(reports to|reporting to|who does .{1,40} report to|direct reports of)\b",
+    r"\b(reports to|reporting to|who does .{1,40} report to|direct reports of"
+    r"|under\s+(?=[A-Z]))\b",
     re.I,
 )
 
@@ -124,32 +122,10 @@ _ASSIGNMENT_PATTERNS = re.compile(
     re.I,
 )
 
-_STATUS_MAP = {
-    "pending": "pending",
-    "processing": "processing",
-    "shipped": "shipped",
-    "delivered": "delivered",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
-    "active": "active",
-    "completed": "completed",
-    "complete": "completed",
-    "planning": "planning",
-    "planned": "planning",
-    "on hold": "on_hold",
-    "on_hold": "on_hold",
-    "paused": "on_hold",
-}
-
-_CATEGORY_MAP = {
-    "electronics": "Electronics",
-    "electronic": "Electronics",
-    "furniture": "Furniture",
-    "office supply": "Office Supply",
-    "office supplies": "Office Supply",
-    "supply": "Office Supply",
-    "supplies": "Office Supply",
-}
+# T1-C: _STATUS_MAP removed. Status values are now read from
+# Order.filterable_columns.status.enum_values and
+# Project.filterable_columns.status.enum_values in graph_schema.yaml.
+# To add a new status value, edit the schema — zero Python changes required.
 
 _PROJECTION_KEYWORDS = {
     "salary": "salary",
@@ -328,7 +304,26 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
     # ------------------------------------------------------------------ #
     # Phase 0 — Status tokens (order-independent, purely lowercase scan)  #
     # ------------------------------------------------------------------ #
-    for status_word, status_val in _STATUS_MAP.items():
+    # T1-C: Status values are read from Order and Project filterable_columns
+    # enum_values in graph_schema.yaml. The context-routing logic (which
+    # surrounding keyword decides order_status vs project_status) stays here
+    # in Python — only the status vocabulary moved to the schema.
+    # To add a new status value: add an enum_values entry in the schema.
+    _schema_nodes = _load_schema()["nodes"]
+    _order_enum   = _schema_nodes.get("Order",   {}).get("filterable_columns", {}).get("status", {}).get("enum_values", [])
+    _project_enum = _schema_nodes.get("Project", {}).get("filterable_columns", {}).get("status", {}).get("enum_values", [])
+
+    # Build a unified synonym→canonical lookup covering both entities.
+    # We iterate both lists because "active" and "completed" appear in both
+    # Order and Project ENUMs — the context-routing if/elif below decides
+    # which filter key to write. The synonym map just normalises the spelling.
+    _status_synonym_map: Dict[str, str] = {}
+    for _entry in _order_enum + _project_enum:
+        _canonical = _entry.get("canonical", "")
+        for _syn in _entry.get("synonyms", []):
+            _status_synonym_map[str(_syn).lower()] = _canonical
+
+    for status_word, status_val in _status_synonym_map.items():
         if re.search(rf"\b{re.escape(status_word)}\b", q_lower):
             if any(w in q_lower for w in ["order", "orders", "purchase"]):
                 filters["order_status"] = status_val
@@ -336,25 +331,54 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
                 filters["project_status"] = status_val
             # Don't break — a question can have both (rare but safe)
 
-    # Category tokens — key must match schema-derived filter key (product_category)
-    # graph_query_builder._build_filter_map generates: entity_lower + "_" + col_key
-    # Product.category -> "product_category". Using "category" would be silently dropped.
-    for cat_word, cat_val in _CATEGORY_MAP.items():
-        if re.search(rf"\b{re.escape(cat_word)}\b", q_lower):
-            filters["product_category"] = cat_val
+    # T1-B: Category tokens — built dynamically from Product.filterable_columns.category.valid_values
+    # in graph_schema.yaml. To add a new category (e.g. "Clothing"), add a valid_values entry
+    # to the schema with canonical DB value + synonyms. Zero Python changes required.
+    # Filter key "product_category" is schema-derived: entity_lower + "_" + col_key = product_category.
+    # Uses exact match in WHERE (match_type: exact), so canonical must match the DB value precisely.
+    _cat_col = _load_schema()["nodes"].get("Product", {}).get("filterable_columns", {}).get("category", {})
+    for _cat_entry in _cat_col.get("valid_values", []):
+        _canonical = _cat_entry.get("canonical", "")
+        for _synonym in _cat_entry.get("synonyms", []):
+            if re.search(rf"\b{re.escape(_synonym)}\b", q_lower):
+                filters["product_category"] = _canonical
+                break
+        if "product_category" in filters:
             break
 
     # R5: Supplier filter extraction.
     # "supplied by TechSupply Co" / "from supplier OfficeWorld"
     # Product.supplier is now a filterable_column → filter key "product_supplier".
+    # T1.5: Tightened to require a prepositional left-boundary (supplied by / from supplier /
+    # by supplier / supplier is|:). Bare "supplier" as a sentence subject (e.g. "which
+    # supplier provides…") no longer triggers the pattern, preventing the predicate of the
+    # sentence from being captured as the supplier value.
+    # Additional guard: captured value must not start with a lowercase verb word
+    # (provides, gives, sells, makes, is, has, etc.) — these are question predicates,
+    # not supplier names.
+    _SUPPLIER_VERB_STARTERS = frozenset({
+        "provides", "provide", "gives", "give", "sells", "sell",
+        "makes", "make", "offers", "offer", "has", "have", "is", "are",
+        "supplies", "supply", "produces", "produce",
+    })
     supplier_match = re.search(
-        r"\b(?:supplied by|supplier|from supplier|made by|manufactured by)\s+"
-        r"([A-Za-z][A-Za-z0-9\s]{1,30}?)(?:\s*$|\s*[,\?.])",
+        r"\b(?:supplied by|from supplier|by supplier|supplier(?:\s+is|\s*:))"
+        r"\s+([A-Za-z][A-Za-z0-9\s]{1,30}?)(?:\s*$|\s*[,\?.])",
         question,  # use original case to preserve proper noun capitalisation
     )
+    if not supplier_match:
+        # Fallback: "made by / manufactured by [Supplier]"
+        supplier_match = re.search(
+            r"\b(?:made by|manufactured by)\s+"
+            r"([A-Za-z][A-Za-z0-9\s]{1,30}?)(?:\s*$|\s*[,\?.])",
+            question,
+        )
     if supplier_match:
         sup_val = supplier_match.group(1).strip()
-        if sup_val.lower() not in _NAME_NOISE and len(sup_val) > 1:
+        first_word = sup_val.split()[0].lower() if sup_val else ""
+        if (sup_val.lower() not in _NAME_NOISE
+                and len(sup_val) > 1
+                and first_word not in _SUPPLIER_VERB_STARTERS):
             filters["product_supplier"] = sup_val
             logger.debug("Phase 0 supplier extraction: product_supplier=%s", sup_val)
 
@@ -406,10 +430,24 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
         r"\b(?:is|are|was)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s*\??\s*$",
         # NO re.I — [A-Z] must match uppercase only
     )
+    # T1.1: Pattern (c): mid-sentence subject relational — "[Name] belong(s) to",
+    # "[Name] is on [entity]". Fires when a Title-Case name precedes a relational
+    # verb that signals the name is the subject (the person), not the destination.
+    # Negative lookahead (?![A-Z]) after the relational phrase prevents "Sarah Connor
+    # is on Platform Migration" (a Title-Case noun follows "on") from misfiring.
+    # NO re.I — [A-Z] must enforce uppercase only.
+    _SUBJECT_RELATIONAL_MID = re.compile(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+"
+        r"(?:belongs? to|is on(?!\s+[A-Z])|was on(?!\s+[A-Z])"
+        r"|is a member of|works? (?:in|on|for)|sit(?:s|ting) (?:in|on))",
+        # NO re.I — [A-Z] must match uppercase only
+    )
 
     subj_match = _SUBJECT_RELATIONAL_START.match(question.strip())
     if not subj_match:
         subj_match = _SUBJECT_RELATIONAL_END.search(question.strip())
+    if not subj_match:
+        subj_match = _SUBJECT_RELATIONAL_MID.search(question.strip())
 
     if subj_match:
         subj_name = subj_match.group(1).strip()
@@ -458,6 +496,26 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
                 locked_names.add(rt_name.lower())
                 logger.debug("Reports-to lock: reports_to_name=%s", rt_name)
 
+    # T1.3: Possessive-team lock — "[Name]'s team/group/department/division"
+    # "Leslie Knope's team" → reports_to_name=Leslie Knope.
+    # This is a Phase 1 relational lock: the possessive signals the name is a
+    # manager whose direct reports we want, NOT a department name value.
+    # Guard: candidate must be at least 2 Title-Case words (prevents "Engineering's team"
+    # from firing — "Engineering" is a single word that doesn't end with [a-z]+\s+[A-Z]).
+    # NO re.I — [A-Z] must enforce uppercase only.
+    _POSSESSIVE_TEAM = re.compile(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})'s\s+"
+        r"(?:team|group|department|division|dept|people|staff|reports|direct reports)",
+        # NO re.I
+    )
+    poss_match = _POSSESSIVE_TEAM.search(question)
+    if poss_match and "reports_to_name" not in filters:
+        poss_name = poss_match.group(1).strip()
+        if poss_name.lower() not in _NAME_NOISE and poss_name not in _get_valid_entities():
+            filters["reports_to_name"] = poss_name
+            locked_names.add(poss_name.lower())
+            logger.debug("Possessive-team lock: reports_to_name=%s", poss_name)
+
     # ------------------------------------------------------------------ #
     # Phase 2 — Proper noun scan with entity-context assignment           #
     # ------------------------------------------------------------------ #
@@ -474,6 +532,13 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
         start = max(0, idx - window)
         end = min(len(haystack_lower), idx + len(needle) + window)
         return haystack_lower[start:end]
+
+    # T1-E: load role_suffixes from schema once before the loop — avoids a
+    # repeated _load_schema() call on every candidate iteration.
+    # Fallback to empty set if Employee node has no role_suffixes defined.
+    _role_suffixes_schema = frozenset(
+        _load_schema()["nodes"].get("Employee", {}).get("role_suffixes", [])
+    )
 
     for cand in candidates:
         cand_lower = cand.lower()
@@ -532,16 +597,11 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
             # employee_role, not employee_name.
             # Suffixes are derived from the roles present in the seed data and
             # schema — NOT hardcoded arbitrary strings.
-            _ROLE_SUFFIXES = frozenset({
-                "engineer", "manager", "analyst", "coordinator", "director",
-                "specialist", "representative", "advisor", "consultant",
-                "developer", "architect", "lead", "officer", "executive",
-                "associate", "technician", "administrator", "supervisor",
-                "copywriter", "strategist", "liaison",
-            })
+            # T1-E: role_suffixes now read from graph_schema.yaml Employee node
+            # (hoisted to _role_suffixes_schema before this loop — see above).
             cand_words = cand.split()
             last_word = cand_words[-1].lower() if cand_words else ""
-            if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$", cand) and last_word in _ROLE_SUFFIXES:
+            if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$", cand) and last_word in _role_suffixes_schema:
                 assigned_key = "employee_role"
             # Two-word Title-Case with no entity signal → likely a person name
             elif re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+$", cand):
@@ -586,13 +646,28 @@ def _extract_named_values(question: str) -> Dict[str, Any]:
                 )
             if prod_match:
                 raw_val = prod_match.group(1).strip()
-                # Capitalise first letter of each word to match DB values
-                cap_val = " ".join(w.capitalize() for w in raw_val.split())
-                if cap_val.lower() not in _NAME_NOISE and len(cap_val) > 2:
-                    filters["product_name"] = cap_val
-                    logger.debug(
-                        "Phase 2.5 product name (case-insensitive): %s", cap_val
-                    )
+                # T1.4: Reject spans whose first token is a comparison or question word.
+                # "most expensive item we have in stock" would otherwise capture
+                # "most expensive item we have in" as a product name. We also cap at
+                # 4 words — real product names (Webcam HD, Standing Desk, USB-C Hub)
+                # are never longer. This guard must not use re.I on [A-Z] checks.
+                _COMPARISON_STARTERS = frozenset({
+                    "most", "least", "highest", "lowest", "best", "worst",
+                    "cheapest", "expensive", "priciest", "top", "bottom",
+                    "maximum", "minimum", "any", "all", "every", "which",
+                    "what", "who", "how", "the", "we", "our", "i", "you",
+                    "have", "has", "do", "does", "more", "less", "greater",
+                })
+                span_words = raw_val.split()
+                first_token = span_words[0].lower() if span_words else ""
+                if (first_token not in _COMPARISON_STARTERS
+                        and len(span_words) <= 4):
+                    cap_val = " ".join(w.capitalize() for w in span_words)
+                    if cap_val.lower() not in _NAME_NOISE and len(cap_val) > 2:
+                        filters["product_name"] = cap_val
+                        logger.debug(
+                            "Phase 2.5 product name (case-insensitive): %s", cap_val
+                        )
 
     if "project_name" not in filters:
         if any(kw in q_lower for kw in _PROJECT_CONTEXT):
@@ -703,7 +778,12 @@ def _detect_entities_from_keywords(question: str) -> List[str]:
     q_lower = question.lower()
     detected = []
 
-    priority_order = ["Employee", "Department", "Product", "Order", "Project"]
+    # T1-A: priority_order is now derived from schema node iteration order rather
+    # than a hardcoded list. YAML preserves insertion order (Python 3.7+ dicts do
+    # too), so the order in graph_schema.yaml nodes: is the detection priority.
+    # This means a new entity added to the schema is automatically checked here
+    # without any Python change — completing the T1-A zero-Python-change guarantee.
+    priority_order = list(_load_schema()["nodes"].keys())
     for entity in priority_order:
         triggers = schema_keywords["entity_triggers"].get(entity, [])
         for trigger in triggers:

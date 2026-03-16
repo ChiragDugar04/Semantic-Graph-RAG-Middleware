@@ -16,6 +16,18 @@ nodes:
     table: employees
     alias: e
     display_name: "Employee"
+    # Natural-language words that trigger detection of this entity in user questions.
+    # Read by entity_extractor._get_schema_keywords() — add new synonyms here, no Python change needed.
+    trigger_words:
+      - employee
+      - employees
+      - staff
+      - worker
+      - workers
+      - person
+      - people
+      - who
+      - member
     # Columns that can appear in SELECT
     selectable_columns:
       - column: name
@@ -41,20 +53,67 @@ nodes:
       name:
         match_type: like        # uses LIKE %value%
         sql_column: e.name
+        is_named_scope: true    # T2-B: 'Alan Turing salary' wants a record, not COUNT(*)
       role:
         match_type: like
         sql_column: e.role
       salary:
         match_type: exact
         sql_column: e.salary
+    # T1-E: occupational suffixes used by Phase 2 of _extract_named_values to
+    # distinguish role titles (Senior Engineer) from person names (Leslie Knope).
+    # A Title-Case candidate whose last word matches a suffix → employee_role.
+    # To add a new role pattern, append the last word here — no Python change needed.
+    role_suffixes:
+      - engineer
+      - manager
+      - analyst
+      - coordinator
+      - director
+      - specialist
+      - representative
+      - advisor
+      - consultant
+      - developer
+      - architect
+      - lead
+      - officer
+      - executive
+      - associate
+      - technician
+      - administrator
+      - supervisor
+      - copywriter
+      - strategist
+      - liaison
     # The primary key used in JOINs
     primary_key: id
     primary_key_sql: e.id
+    # T1-D: node-level filter supplements — apply whenever Employee is in the path.
+    # reports_to_name fires unconditionally on any Employee path.
+    # department_name subquery fires only when Department is NOT also in the path
+    # (if Department IS in path, its own filterable_column generates the filter key).
+    filter_supplements:
+      reports_to_name:
+        sql: "e.department_id IN (SELECT d.id FROM departments d INNER JOIN employees mgr ON d.manager_id = mgr.id WHERE mgr.name LIKE %(reports_to_name)s)"
+        match: subquery
+        exclude_when_node_in_path: []          # always active on Employee paths
+      department_name:
+        sql: "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)"
+        match: subquery
+        exclude_when_node_in_path: [Department] # suppressed when Department already in path
 
   Department:
     table: departments
     alias: d
     display_name: "Department"
+    trigger_words:
+      - department
+      - departments
+      - dept
+      - team
+      - division
+      - group
     selectable_columns:
       - column: name
         alias: department_name
@@ -71,6 +130,7 @@ nodes:
       name:
         match_type: like
         sql_column: d.name
+        is_named_scope: true    # T2-B: named dept scope — 'headcount in Engineering' wants records
       budget:
         match_type: exact
         sql_column: d.budget
@@ -84,6 +144,25 @@ nodes:
     table: products
     alias: p
     display_name: "Product"
+    # D1: category words (electronics, furniture, etc.) must be here so that
+    # category-only queries ("Show me all electronics") fire Product detection
+    # without needing the LLM fallback. Add new category synonyms here.
+    trigger_words:
+      - product
+      - products
+      - item
+      - items
+      - stock
+      - inventory
+      - unit
+      - units
+      - electronics
+      - electronic
+      - furniture
+      - office supply
+      - office supplies
+      - supply
+      - supplies
     selectable_columns:
       - column: name
         alias: product_name
@@ -106,12 +185,29 @@ nodes:
       name:
         match_type: like
         sql_column: p.name
+        is_named_scope: true    # T2-B: named product scope — 'units of Webcam HD' wants that product
       category:
         match_type: exact
         sql_column: p.category
+        is_named_scope: true    # T2-B: named category scope — 'total stock of electronics' wants the list
+        # T1-B: valid_values drives category filter extraction in entity_extractor.py Phase 0.
+        # To add a new product category: add a new entry here with its canonical DB value
+        # and any lowercase synonyms users might type. Zero Python changes required.
+        # canonical must match the exact string stored in products.category in the database.
+        valid_values:
+          - canonical: "Electronics"
+            synonyms: [electronics, electronic]
+          - canonical: "Furniture"
+            synonyms: [furniture]
+          - canonical: "Office Supply"
+            synonyms: [office supply, office supplies, supply, supplies]
       price:
         match_type: exact
         sql_column: p.price
+      supplier:
+        match_type: like
+        sql_column: p.supplier
+        is_named_scope: true    # T2-B: named supplier scope — 'total value from TechSupply' wants records
     primary_key: id
     primary_key_sql: p.id
 
@@ -119,6 +215,13 @@ nodes:
     table: orders
     alias: o
     display_name: "Order"
+    trigger_words:
+      - order
+      - orders
+      - purchase
+      - purchases
+      - bought
+      - ordered
     selectable_columns:
       - column: id
         alias: order_id
@@ -136,6 +239,24 @@ nodes:
       status:
         match_type: exact
         sql_column: o.status
+        # T1-C: enum_values drives order status extraction in entity_extractor.py Phase 0.
+        # canonical must match the exact ENUM value in schema.sql orders.status.
+        # To add a new order status (e.g. "returned"), add an entry here — zero Python changes.
+        enum_values:
+          - canonical: "pending"
+            synonyms: [pending]
+          - canonical: "processing"
+            synonyms: [processing]
+          - canonical: "shipped"
+            synonyms: [shipped]
+          - canonical: "delivered"
+            synonyms: [delivered]
+          - canonical: "cancelled"
+            synonyms: [cancelled, canceled]
+          - canonical: "active"
+            synonyms: [active]
+          - canonical: "completed"
+            synonyms: [completed, complete]
       order_date:
         match_type: exact
         sql_column: o.order_date
@@ -146,6 +267,13 @@ nodes:
     table: projects
     alias: proj
     display_name: "Project"
+    trigger_words:
+      - project
+      - projects
+      - initiative
+      - initiatives
+      - program
+      - programs
     selectable_columns:
       - column: name
         alias: project_name
@@ -175,9 +303,22 @@ nodes:
       name:
         match_type: like
         sql_column: proj.name
+        is_named_scope: true    # T2-B: named project scope — 'budget of Platform Migration' wants that record
       status:
         match_type: exact
         sql_column: proj.status
+        # T1-C: enum_values drives project status extraction in entity_extractor.py Phase 0.
+        # canonical must match the exact ENUM value in schema.sql projects.status.
+        # To add a new project status (e.g. "archived"), add an entry here — zero Python changes.
+        enum_values:
+          - canonical: "planning"
+            synonyms: [planning, planned]
+          - canonical: "active"
+            synonyms: [active]
+          - canonical: "completed"
+            synonyms: [completed, complete]
+          - canonical: "on_hold"
+            synonyms: [on_hold, "on hold", paused]
     primary_key: id
     primary_key_sql: proj.id
 
@@ -223,6 +364,14 @@ edges:
     extra_select:
       - "pa.role_on_project AS assignment_role"
     notes: "Many-to-many via project_assignments junction table"
+    # T1-D: cross-table filters that apply when this edge is traversed (Project in path).
+    filter_supplements:
+      manager_name:
+        sql: "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
+        match: subquery
+      project_department:
+        sql: "proj.department_id IN (SELECT id FROM departments WHERE name LIKE %(project_department)s)"
+        match: subquery
 
   - from_node: Project
     to_node: Employee

@@ -57,6 +57,9 @@ nodes:
       role:
         match_type: like
         sql_column: e.role
+        # disambiguation_note: read by _build_schema_context() → emits DISAMBIGUATION section.
+        # Prevents "in Marketing" / "in Sales" from being mistaken for a role filter.
+        disambiguation_note: "job title queries only (e.g. Senior Engineer, Analyst). For team/group membership use department_name."
       salary:
         match_type: exact
         sql_column: e.salary
@@ -98,10 +101,27 @@ nodes:
         sql: "e.department_id IN (SELECT d.id FROM departments d INNER JOIN employees mgr ON d.manager_id = mgr.id WHERE mgr.name LIKE %(reports_to_name)s)"
         match: subquery
         exclude_when_node_in_path: []          # always active on Employee paths
+        # semantic_signals: phrases that indicate THIS key is correct (not manager_name/department_name).
+        # Read by _build_schema_context() → emits CROSS-TABLE KEY USAGE section in prompt.
+        # Add new phrasing variants here; zero Python changes required.
+        semantic_signals:
+          - "X's team"
+          - "team of X"
+          - "under X"
+          - "who reports to X"
+          - "direct reports of X"
+          - "everyone under X"
+          - "people under X"
+          - "reports to X"
       department_name:
         sql: "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)"
         match: subquery
         exclude_when_node_in_path: [Department] # suppressed when Department already in path
+        semantic_signals:
+          - "employees in"
+          - "people in"
+          - "staff in"
+          - "workers in"
 
   Department:
     table: departments
@@ -114,6 +134,21 @@ nodes:
       - team
       - division
       - group
+    # multi_entity_triggers: phrases that signal the question is asking WHICH department/team
+    # an employee belongs to — both Employee AND Department must be in entities[].
+    # Read by _build_schema_context() → emits a binding MULTI-ENTITY RULE in the prompt.
+    # Add new membership-query phrasings here; zero Python changes required.
+    multi_entity_triggers:
+      - "which department"
+      - "what department"
+      - "which team"
+      - "what team"
+      - "belong to"
+      - "belongs to"
+      - "is in which"
+      - "is on which"
+      - "in which department"
+      - "in which team"
     selectable_columns:
       - column: name
         alias: department_name
@@ -369,6 +404,16 @@ edges:
       manager_name:
         sql: "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
         match: subquery
+        # semantic_signals: phrases that mean "the named person manages a project"
+        # Distinguishes manager_name from reports_to_name (org-chart) at prompt time.
+        semantic_signals:
+          - "managed by X"
+          - "X is managing"
+          - "running the"
+          - "who manages"
+          - "who is running"
+          - "X manages"
+          - "managing"
       project_department:
         sql: "proj.department_id IN (SELECT id FROM departments WHERE name LIKE %(project_department)s)"
         match: subquery
@@ -407,3 +452,90 @@ edges:
     join_type: INNER
     join_condition: "o.product_id = p.id"
     notes: "An order is for a specific product"
+# ============================================================
+# QUERY LIMITS
+# Patterns that cannot be answered by this middleware.
+# The LLM extraction layer reads these and returns
+# question_type "other" when the question matches any entry.
+# Add new unsupported patterns here — zero Python changes needed.
+# ============================================================
+
+query_limits:
+  # no_filter_signals: when question contains one of these words AND asks about a numeric
+  # or ranking field, the LLM must emit filters:{} (empty) and question_type:"comparison".
+  # Never invent a filter value (e.g. 'exact', 'highest', '*') for these fields.
+  # Read by _build_schema_context() → emits RANKING RULE in prompt.
+  # To add a new superlative keyword: append to trigger_words. Zero Python changes.
+  no_filter_signals:
+    trigger_words:
+      - "most"
+      - "highest"
+      - "lowest"
+      - "least"
+      - "best"
+      - "worst"
+      - "top"
+      - "bottom"
+      - "rank"
+      - "ranked"
+      - "ranking"
+      - "earns the most"
+      - "earns the least"
+      - "most expensive"
+      - "cheapest"
+    applies_to_fields:
+      - employee_salary
+      - department_budget
+      - project_budget
+      - product_price
+  unsupported_patterns:
+    - description: "HAVING COUNT — more than N items per group"
+      user_message: "I can't answer questions that need counting across groups (e.g. 'more than one project'). Try asking which projects a specific person is on instead."
+      # linguistic_signals: exact substring matches against the normalised question.
+      # Read by _build_schema_context() (prompt section) AND by the Python pre-filter
+      # in extract_entities() (fast-path before LLM call). Add new surface forms here.
+      linguistic_signals:
+        - "more than one"
+        - "more than two"
+        - "more than three"
+        - "assigned to multiple"
+        - "working on more than"
+        - "on more than"
+        - "at least two"
+        - "at least three"
+    - description: "Subquery average comparison"
+      user_message: "I can't compare individual values against a computed average. Try asking for the highest or lowest value directly instead."
+      linguistic_signals:
+        - "more than the average"
+        - "higher than the average"
+        - "above the average"
+        - "below the average"
+        - "cost more than average"
+        - "earn more than average"
+        - "paid more than average"
+    - description: "Cross-record temporal comparison"
+      user_message: "I can't compare dates or timelines across different records. Try asking about a specific project's start or end date instead."
+      linguistic_signals:
+        - "started after"
+        - "completed before"
+        - "after the last"
+        - "before the first"
+        - "since the last"
+    - description: "Aggregation by group needing GROUP BY / COUNT"
+      user_message: "I can't group and count across all records. Try asking about a specific supplier or category instead."
+      linguistic_signals:
+        - "which supplier provides the most"
+        - "supplier with the most"
+        - "most products by"
+        - "count by supplier"
+        - "how many products does each"
+        - "rank the suppliers"
+    - description: "Computed difference or delta between two aggregate values"
+      user_message: "I can't compute differences between aggregate values like highest and lowest salary. Try asking for the highest salary and the lowest salary as two separate questions."
+      linguistic_signals:
+        - "difference between"
+        - "salary difference"
+        - "pay difference"
+        - "how much more than"
+        - "how much less than"
+        - "gap between"

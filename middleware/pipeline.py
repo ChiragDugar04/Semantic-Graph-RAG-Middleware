@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import List, Optional, Tuple
+
+import networkx as nx
 
 from middleware.models import (
     EntityExtractionResult,
@@ -121,7 +124,7 @@ def run_pipeline(question: str) -> MiddlewareTrace:
         )
         extraction = extraction.model_copy(update={"question_type": "lookup"})
 
-    traversal, join_chain = _run_graph_traversal(extraction)
+    traversal, join_chain = _run_graph_traversal(extraction, question)
     trace.graph_traversal = traversal
     trace.pipeline_stage_reached = "traversal"
 
@@ -218,6 +221,7 @@ def _populate_legacy_fields(
 
 def _run_graph_traversal(
     extraction: EntityExtractionResult,
+    question: str = "",
 ) -> Tuple[GraphTraversal, List[JoinStep]]:
     start = time.time()
     entities = extraction.entities
@@ -240,7 +244,7 @@ def _run_graph_traversal(
     # traversal builds the correct JOIN chain.
     unique_entities = list(dict.fromkeys(entities))
     unique_entities = _expand_entities_from_filters(
-        unique_entities, filters, q_type=extraction.question_type
+        unique_entities, filters, q_type=extraction.question_type, question=question,
     )
 
     if len(set(unique_entities)) == 1:
@@ -308,6 +312,7 @@ def _expand_entities_from_filters(
     entities: List[str],
     filters: dict,
     q_type: str = "lookup",
+    question: str = "",
 ) -> List[str]:
     """
     Filter-Aware Path Extension.
@@ -321,6 +326,13 @@ def _expand_entities_from_filters(
     at the end of the path (lowest priority) without any Python rule.
     Semantic rules that require specific insertion positions or involve
     non-schema filter keys (manager_name, reports_to_name) are kept below.
+
+    Refinement 1 — Signal-to-Entity Registry (T2.5):
+    Each node in graph_schema.yaml can carry an injection_signals list of
+    pattern names. If employee_name is in filters AND a listed signal matches
+    the question AND the node is not yet in path → inject that node.
+    The loop is fully generic: adding a new signal requires only a schema edit
+    and a registry entry in entity_extractor._INJECTION_SIGNAL_REGISTRY.
 
     Generic injection (this loop — no Python change needed for new entities):
     - Any filter key matching <entity_lower>_<col_key> where entity is in
@@ -336,6 +348,88 @@ def _expand_entities_from_filters(
     """
     expanded = list(dict.fromkeys(entities))   # deduplicate, preserve order
     entity_set = set(expanded)
+
+    # ------------------------------------------------------------------ #
+    # Fix B — Possessive filter correction                                 #
+    # Problem: "Leslie Knope's team" → LLM emits department_name=         #
+    # "Leslie Knop's Team" instead of reports_to_name="Leslie Knope".     #
+    # The possessive "X's <team-word>" is an org-chart query, not a       #
+    # department-name lookup.                                              #
+    #                                                                     #
+    # Detection: department_name value matches Title-Case name + "'s" +   #
+    # a word that appears in Department.multi_entity_triggers (e.g."team")#
+    #                                                                     #
+    # Correction:                                                          #
+    #  1. Extract person name (everything before "'s")                     #
+    #  2. Set filters['reports_to_name'] = extracted_name                  #
+    #  3. Delete filters['department_name']                                #
+    #  4. Remove Department from entity_set (not needed for reports_to)    #
+    #                                                                     #
+    # Zero hardcoding: trigger words come from Department.multi_entity_   #
+    # triggers in the schema. Name extraction uses a generic Title-Case   #
+    # regex. Multi-DB safe: any schema node declaring multi_entity_        #
+    # triggers with team-like words participates automatically.            #
+    # ------------------------------------------------------------------ #
+    if "department_name" in filters:
+        dept_val = filters["department_name"]
+        dept_node    = _graph._nodes.get("Department", {})
+        # Use trigger_words (bare word list: "team", "dept", "division", etc.)
+        # not multi_entity_triggers (phrase list: "which team", "belong to", etc.)
+        # The trailing word after "'s" will be a single word like "team" or "group",
+        # which matches trigger_words entries, not multi-word trigger phrases.
+        dept_trigger_words = {t.lower() for t in dept_node.get("trigger_words", [])}
+        # Pattern: one or more Title-Case words, then 's (with or without
+        # the apostrophe), then a space and one more word.
+        # Handles: "Leslie Knope's Team", "Leslie Knop's Team"
+        _possessive_re = re.compile(
+            r"^([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+)*)'s?\s*(\w+)",
+            re.UNICODE,
+        )
+        m = _possessive_re.match(dept_val.strip())
+        if m:
+            candidate_name = m.group(1).strip()
+            trailing_word  = m.group(2).lower()
+            if trailing_word in dept_trigger_words:
+                # Confirmed possessive org-chart query — rewrite the filter
+                filters = dict(filters)          # mutable copy (caller's dict unchanged)
+                filters["reports_to_name"] = candidate_name
+                del filters["department_name"]
+                expanded = [e for e in expanded if e != "Department"]
+                entity_set.discard("Department")
+                logger.info(
+                    "Possessive correction: department_name='%s' → "
+                    "reports_to_name='%s' (trailing word '%s' in dept trigger_words)",
+                    dept_val, candidate_name, trailing_word,
+                )
+
+    # ------------------------------------------------------------------ #
+    # Fix 1 — Schema-driven multi_entity_triggers injection               #
+    # When the LLM returns only ["Employee"] but the question contains a  #
+    # phrase that signals a membership query (e.g. "which department",    #
+    # "belong to"), inject the secondary entity unconditionally.          #
+    #                                                                     #
+    # Why pipeline not prompt: the prompt rule was present and still      #
+    # failed for sentence structures where the person name is dominant    #
+    # (Q05: "Which dept does Sarah Connor belong to?"). The pipeline      #
+    # enforces this after the LLM regardless of sentence structure.       #
+    #                                                                     #
+    # Zero hardcoding: reads multi_entity_triggers from _graph._nodes.   #
+    # Any node that declares multi_entity_triggers participates here.     #
+    # Multi-DB safe: schema author declares triggers per entity in YAML.  #
+    # ------------------------------------------------------------------ #
+    if question:
+        q_norm = re.sub(r"\s+", " ", question.lower())
+        for entity, node_data in _graph._nodes.items():
+            if entity not in entity_set:
+                for trigger in node_data.get("multi_entity_triggers", []):
+                    if trigger in q_norm:
+                        expanded.append(entity)
+                        entity_set.add(entity)
+                        logger.info(
+                            "Path extension: injected %s via multi_entity_trigger '%s'",
+                            entity, trigger,
+                        )
+                        break  # one trigger match is sufficient per entity
 
     # ------------------------------------------------------------------ #
     # T2-A: Generic filter-to-entity injection loop                       #
@@ -386,8 +480,21 @@ def _expand_entities_from_filters(
             matched_entity, filter_key,
         )
 
+    # --- LLM entity injection (formerly Refinement 1 injection-signal loop) ---
+    # The schema-driven LLM extractor now returns complete entity lists directly
+    # (e.g. ["Employee", "Project"] for assignment queries). The regex-based
+    # injection_signals mechanism is no longer needed. The structural traversal
+    # rules below (Department positional injection, manager_name→Project, N2, N4,
+    # Order display expansion) remain — they encode JOIN correctness constraints
+    # from the graph topology, not linguistic patterns.
+
     # --- Department injection (Semantic — positional: after Employee) ---
-    if "department_name" in filters and "Department" not in entity_set:
+    # P6.1: Guard replicated from T2-A loop — skip if Order is already in path.
+    # When Order is present, department_name is resolved via Employee's
+    # filter_supplements.department_name subquery (no Department JOIN needed).
+    # Without this guard, Department is injected positionally → Department→Order
+    # NoPathError → fallback to Employee-only → order_status filter silently dropped.
+    if "department_name" in filters and "Department" not in entity_set and "Order" not in entity_set:
         if "Employee" in entity_set:
             if "Project" in entity_set:
                 # Need full 3-hop: Employee → Department → Project
@@ -455,6 +562,31 @@ def _expand_entities_from_filters(
     # Neighbours are derived from the live graph object — not hardcoded strings —
     # so this stays correct if edges are ever added/renamed in graph_schema.yaml.
     if "Order" in entity_set:
+        # Fix 4 — Order+Department co-presence guard                         #
+        # Department has no edge to Order in the schema (no Order↔Dept join). #
+        # When both appear (e.g. Q20: "Who in Operations placed orders..."),   #
+        # Department must be removed from the path. The department_name filter #
+        # is resolved instead via Employee's filter_supplement subquery, which #
+        # fires automatically whenever Department is NOT in the path.          #
+        # This guard removes Department regardless of whether it came from the #
+        # LLM or from injection — the topology constraint applies either way.  #
+        # Multi-DB safe: reads only from schema graph edges, no names hardcoded.#
+        if "Department" in entity_set:
+            # Use has_edge (direct edge only) — NOT nx.has_path which returns True
+            # for any reachable multi-hop path (Order→Employee→Department exists
+            # as a 2-hop but that is not a valid JOIN anchor for this query).
+            # We only preserve Department in the entity list when there is a direct
+            # schema edge Order→Department. In the current schema there is none.
+            has_direct_order_dept_edge = _graph._graph.has_edge("Order", "Department")
+            if not has_direct_order_dept_edge:
+                expanded = [e for e in expanded if e != "Department"]
+                entity_set.discard("Department")
+                logger.info(
+                    "Path extension: removed Department "
+                    "(Order in path — no Order→Department edge; "
+                    "department_name resolved via Employee subquery)"
+                )
+
         schema_order_neighbours = set(_graph._graph.successors("Order"))
         for neighbour in sorted(schema_order_neighbours):  # sorted for stable order
             if neighbour not in entity_set:

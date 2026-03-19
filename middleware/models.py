@@ -57,7 +57,6 @@ class DBResult(BaseModel):
     self_healing_triggered: bool = Field(default=False)
     healing_reason: str = Field(default="")
 
-
 class EntityExtractionResult(BaseModel):
     entities: List[str] = Field(default_factory=list)
     filters: Dict[str, Any] = Field(default_factory=dict)
@@ -89,7 +88,6 @@ class EntityExtractionResult(BaseModel):
             self.question_type == "other"
             and self.confidence_score >= ExtractionConfidence.TRUST_THRESHOLD
         )
-
 
 class GraphTraversal(BaseModel):
     path_taken: List[str] = Field(default_factory=list)

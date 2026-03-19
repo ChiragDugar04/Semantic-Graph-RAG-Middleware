@@ -1,23 +1,9 @@
-# ============================================================
-# SEMANTIC GRAPH SCHEMA
-# Defines the knowledge graph of database entities and their
-# relationships. This is the single source of truth for the
-# SemanticGraph class in middleware/semantic_graph.py
-#
-# To add a new entity:
-#   1. Add a node entry below
-#   2. Add edge entries describing its relationships
-#   3. Zero Python changes required
-# ============================================================
-
 nodes:
 
   Employee:
     table: employees
     alias: e
     display_name: "Employee"
-    # Natural-language words that trigger detection of this entity in user questions.
-    # Read by entity_extractor._get_schema_keywords() — add new synonyms here, no Python change needed.
     trigger_words:
       - employee
       - employees
@@ -28,7 +14,7 @@ nodes:
       - people
       - who
       - member
-    # Columns that can appear in SELECT
+
     selectable_columns:
       - column: name
         alias: employee_name
@@ -48,25 +34,25 @@ nodes:
         alias: email
         label: "Email"
         default_hidden: true
-    # Columns that can appear in WHERE filters
     filterable_columns:
       name:
-        match_type: like        # uses LIKE %value%
+        match_type: like
         sql_column: e.name
-        is_named_scope: true    # T2-B: 'Alan Turing salary' wants a record, not COUNT(*)
+        is_named_scope: true
+        # owner_entity + insert_before_entity: when employee_name is in filters and
+        # Project is already in the entity set, inject Employee BEFORE Project so the
+        # graph traverses Employee->Project (correct JOIN direction), not Project alone.
+        # Read by pipeline._expand_entities_from_filters() supplement-owner loop.
+        owner_entity: Employee
+        insert_before_entity: Project
       role:
         match_type: like
         sql_column: e.role
-        # disambiguation_note: read by _build_schema_context() → emits DISAMBIGUATION section.
-        # Prevents "in Marketing" / "in Sales" from being mistaken for a role filter.
+        is_optional_filter: true
         disambiguation_note: "job title queries only (e.g. Senior Engineer, Analyst). For team/group membership use department_name."
       salary:
         match_type: exact
         sql_column: e.salary
-    # T1-E: occupational suffixes used by Phase 2 of _extract_named_values to
-    # distinguish role titles (Senior Engineer) from person names (Leslie Knope).
-    # A Title-Case candidate whose last word matches a suffix → employee_role.
-    # To add a new role pattern, append the last word here — no Python change needed.
     role_suffixes:
       - engineer
       - manager
@@ -89,21 +75,48 @@ nodes:
       - copywriter
       - strategist
       - liaison
-    # The primary key used in JOINs
     primary_key: id
     primary_key_sql: e.id
-    # T1-D: node-level filter supplements — apply whenever Employee is in the path.
-    # reports_to_name fires unconditionally on any Employee path.
-    # department_name subquery fires only when Department is NOT also in the path
-    # (if Department IS in path, its own filterable_column generates the filter key).
+    empty_result_hint: "No employees were found matching your criteria. Please check the name, department, or role and try again."
+    empty_result_keywords: [who, employee, employees, staff, worker, workers, person, people, member]
+    default_sort:
+      comparison:
+        column: e.salary
+        direction: DESC
+        limit: 10
+        scope_filter_keys: [department_name, project_name, manager_name]
+      list:
+        column: e.name
+        direction: ASC
+      cross_entity:
+        column: e.name
+        direction: ASC
+      lookup:
+        limit: 10
+    aggregation_defaults:
+      group_anchor: false
+      count_column: e.id
+      avg_columns: [e.salary]
+      max_columns: [e.salary]
+      min_columns: [e.salary]
+    # T1-D: node-level filter supplements.
     filter_supplements:
       reports_to_name:
         sql: "e.department_id IN (SELECT d.id FROM departments d INNER JOIN employees mgr ON d.manager_id = mgr.id WHERE mgr.name LIKE %(reports_to_name)s)"
         match: subquery
-        exclude_when_node_in_path: []          # always active on Employee paths
-        # semantic_signals: phrases that indicate THIS key is correct (not manager_name/department_name).
-        # Read by _build_schema_context() → emits CROSS-TABLE KEY USAGE section in prompt.
-        # Add new phrasing variants here; zero Python changes required.
+        exclude_when_node_in_path: []
+        # owner_entity: the entity this supplement key belongs to.
+        # When reports_to_name is in filters, ensure Employee is in the path.
+        owner_entity: Employee
+        # excludes_entities: remove these from the path when this supplement fires.
+        # reports_to is an org-chart query, not a project query.
+        excludes_entities: [Project]
+        # conditional_exclude: only apply excludes_entities when the named filter
+        # is ABSENT from the current filters dict.
+        # "remove Project ONLY IF manager_name is not also present" — if both
+        # reports_to_name and manager_name are in filters, keep Project.
+        conditional_exclude:
+          absent_filter: manager_name
         semantic_signals:
           - "X's team"
           - "team of X"
@@ -116,7 +129,10 @@ nodes:
       department_name:
         sql: "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)"
         match: subquery
-        exclude_when_node_in_path: [Department] # suppressed when Department already in path
+        exclude_when_node_in_path: [Department]
+        # owner_entity: when department_name supplement fires (Employee path, no Dept node),
+        # Employee must already be in path (it is, since this supplement lives on Employee).
+        owner_entity: Employee
         semantic_signals:
           - "employees in"
           - "people in"
@@ -134,10 +150,6 @@ nodes:
       - team
       - division
       - group
-    # multi_entity_triggers: phrases that signal the question is asking WHICH department/team
-    # an employee belongs to — both Employee AND Department must be in entities[].
-    # Read by _build_schema_context() → emits a binding MULTI-ENTITY RULE in the prompt.
-    # Add new membership-query phrasings here; zero Python changes required.
     multi_entity_triggers:
       - "which department"
       - "what department"
@@ -165,7 +177,8 @@ nodes:
       name:
         match_type: like
         sql_column: d.name
-        is_named_scope: true    # T2-B: named dept scope — 'headcount in Engineering' wants records
+        is_named_scope: true
+        is_optional_filter: true
       budget:
         match_type: exact
         sql_column: d.budget
@@ -174,14 +187,18 @@ nodes:
         sql_column: d.location
     primary_key: id
     primary_key_sql: d.id
+    empty_result_hint: "No department was found matching your criteria. Please verify the department name and try again."
+    empty_result_keywords: [department, departments, dept, team, division, group]
+    aggregation_defaults:
+      group_anchor: true
+      label_column: d.name
+      label_alias: department_name
+      group_by_sql: "d.id, d.name"
 
   Product:
     table: products
     alias: p
     display_name: "Product"
-    # D1: category words (electronics, furniture, etc.) must be here so that
-    # category-only queries ("Show me all electronics") fire Product detection
-    # without needing the LLM fallback. Add new category synonyms here.
     trigger_words:
       - product
       - products
@@ -220,15 +237,12 @@ nodes:
       name:
         match_type: like
         sql_column: p.name
-        is_named_scope: true    # T2-B: named product scope — 'units of Webcam HD' wants that product
+        is_named_scope: true
       category:
         match_type: exact
         sql_column: p.category
-        is_named_scope: true    # T2-B: named category scope — 'total stock of electronics' wants the list
-        # T1-B: valid_values drives category filter extraction in entity_extractor.py Phase 0.
-        # To add a new product category: add a new entry here with its canonical DB value
-        # and any lowercase synonyms users might type. Zero Python changes required.
-        # canonical must match the exact string stored in products.category in the database.
+        is_named_scope: true
+        is_optional_filter: true
         valid_values:
           - canonical: "Electronics"
             synonyms: [electronics, electronic]
@@ -242,9 +256,19 @@ nodes:
       supplier:
         match_type: like
         sql_column: p.supplier
-        is_named_scope: true    # T2-B: named supplier scope — 'total value from TechSupply' wants records
+        is_named_scope: true
     primary_key: id
     primary_key_sql: p.id
+    empty_result_hint: "No products were found matching your search. Please check the product name or category and try again."
+    empty_result_keywords: [product, products, item, items, stock, inventory, unit, units, electronics, furniture, supply, supplies]
+    default_sort:
+      comparison:
+        column: p.price
+        direction: DESC
+        limit: 10
+      list:
+        column: p.name
+        direction: ASC
 
   Order:
     table: orders
@@ -274,9 +298,7 @@ nodes:
       status:
         match_type: exact
         sql_column: o.status
-        # T1-C: enum_values drives order status extraction in entity_extractor.py Phase 0.
-        # canonical must match the exact ENUM value in schema.sql orders.status.
-        # To add a new order status (e.g. "returned"), add an entry here — zero Python changes.
+        is_optional_filter: true
         enum_values:
           - canonical: "pending"
             synonyms: [pending]
@@ -297,6 +319,32 @@ nodes:
         sql_column: o.order_date
     primary_key: id
     primary_key_sql: o.id
+    empty_result_hint: "No orders were found matching your criteria. You can try filtering by a different status or date range."
+    empty_result_keywords: [order, orders, purchase, purchases, bought, ordered]
+    default_sort:
+      comparison:
+        column: o.order_date
+        direction: DESC
+        limit: 20
+      list:
+        column: o.order_date
+        direction: DESC
+        limit: 20
+      cross_entity:
+        column: o.order_date
+        direction: DESC
+        limit: 20
+      lookup:
+        column: o.order_date
+        direction: DESC
+        limit: 20
+    aggregation_defaults:
+      group_anchor: true
+      label_column: o.status
+      label_alias: status
+      group_by_sql: "o.status"
+      count_column: o.id
+      sum_columns: [o.quantity]
 
   Project:
     table: projects
@@ -338,13 +386,11 @@ nodes:
       name:
         match_type: like
         sql_column: proj.name
-        is_named_scope: true    # T2-B: named project scope — 'budget of Platform Migration' wants that record
+        is_named_scope: true
       status:
         match_type: exact
         sql_column: proj.status
-        # T1-C: enum_values drives project status extraction in entity_extractor.py Phase 0.
-        # canonical must match the exact ENUM value in schema.sql projects.status.
-        # To add a new project status (e.g. "archived"), add an entry here — zero Python changes.
+        is_optional_filter: true
         enum_values:
           - canonical: "planning"
             synonyms: [planning, planned]
@@ -356,20 +402,21 @@ nodes:
             synonyms: [on_hold, "on hold", paused]
     primary_key: id
     primary_key_sql: proj.id
+    empty_result_hint: "No projects were found matching your criteria. Please check the project name or status filter."
+    empty_result_keywords: [project, projects, initiative, initiatives, program, programs]
+    default_sort:
+      list:
+        column: proj.name
+        direction: ASC
+    aggregation_defaults:
+      group_anchor: true
+      label_column: proj.name
+      label_alias: project_name
+      group_by_sql: "proj.id, proj.name"
 
 
 # ============================================================
-# EDGES — Relationships between entities
-#
-# Each edge defines:
-#   from_node     : source entity
-#   to_node       : target entity
-#   relation      : human-readable relationship label
-#   join_type     : INNER or LEFT
-#   join_condition: the ON clause (using table aliases from nodes)
-#   junction_table: (optional) for many-to-many via a bridge table
-#   junction_alias: alias for the junction table in SQL
-#   notes         : explanation for developers
+# EDGES
 # ============================================================
 
 edges:
@@ -387,7 +434,7 @@ edges:
     join_type: LEFT
     join_condition: "d.manager_id = e.id"
     notes: "A department has one manager (an employee). Use alias mgr for manager employee."
-    manager_join: true   # flag: JOIN employees twice, second with alias 'mgr'
+    manager_join: true
 
   - from_node: Employee
     to_node: Project
@@ -399,13 +446,13 @@ edges:
     extra_select:
       - "pa.role_on_project AS assignment_role"
     notes: "Many-to-many via project_assignments junction table"
-    # T1-D: cross-table filters that apply when this edge is traversed (Project in path).
     filter_supplements:
       manager_name:
         sql: "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
         match: subquery
-        # semantic_signals: phrases that mean "the named person manages a project"
-        # Distinguishes manager_name from reports_to_name (org-chart) at prompt time.
+        # supplement_injects_entity: when manager_name is in filters, inject Project.
+        # Read by pipeline._SUPPLEMENT_ENTITY_MAP at module startup.
+        supplement_injects_entity: Project
         semantic_signals:
           - "managed by X"
           - "X is managing"
@@ -423,7 +470,7 @@ edges:
     relation: managed_by_employee
     join_type: LEFT
     join_condition: "proj.manager_id = mgr.id"
-    notes: "A project has one manager (an employee). Uses alias 'mgr' to avoid collision with Employee alias 'e' when both tables are joined. pipeline.py and graph_query_builder.py inject this as: LEFT JOIN employees mgr ON mgr.id = proj.manager_id"
+    notes: "A project has one manager (an employee). Uses alias 'mgr'."
 
   - from_node: Project
     to_node: Department
@@ -452,20 +499,12 @@ edges:
     join_type: INNER
     join_condition: "o.product_id = p.id"
     notes: "An order is for a specific product"
+
 # ============================================================
 # QUERY LIMITS
-# Patterns that cannot be answered by this middleware.
-# The LLM extraction layer reads these and returns
-# question_type "other" when the question matches any entry.
-# Add new unsupported patterns here — zero Python changes needed.
 # ============================================================
 
 query_limits:
-  # no_filter_signals: when question contains one of these words AND asks about a numeric
-  # or ranking field, the LLM must emit filters:{} (empty) and question_type:"comparison".
-  # Never invent a filter value (e.g. 'exact', 'highest', '*') for these fields.
-  # Read by _build_schema_context() → emits RANKING RULE in prompt.
-  # To add a new superlative keyword: append to trigger_words. Zero Python changes.
   no_filter_signals:
     trigger_words:
       - "most"
@@ -483,17 +522,19 @@ query_limits:
       - "earns the least"
       - "most expensive"
       - "cheapest"
+      - "expensive"
+      - "maximum"
+      - "minimum"
+      - "max"
+      - "min"
     applies_to_fields:
       - employee_salary
       - department_budget
       - project_budget
       - product_price
   unsupported_patterns:
-    - description: "HAVING COUNT — more than N items per group"
+    - description: "HAVING COUNT -- more than N items per group"
       user_message: "I can't answer questions that need counting across groups (e.g. 'more than one project'). Try asking which projects a specific person is on instead."
-      # linguistic_signals: exact substring matches against the normalised question.
-      # Read by _build_schema_context() (prompt section) AND by the Python pre-filter
-      # in extract_entities() (fast-path before LLM call). Add new surface forms here.
       linguistic_signals:
         - "more than one"
         - "more than two"

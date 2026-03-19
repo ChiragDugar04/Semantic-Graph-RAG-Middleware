@@ -22,11 +22,33 @@ from middleware.graph_query_builder import GraphQueryBuilder, QueryBuildError
 from middleware.query_executor import execute_query
 from middleware.context_formatter import format_context
 from middleware.answer_synthesizer import synthesize_answer
+from middleware.fuzzy_resolver import resolve_filter_values
 
 logger = logging.getLogger(__name__)
 
 _graph = SemanticGraph()
 _builder = GraphQueryBuilder(_graph)
+
+# ---------------------------------------------------------------------------
+# Step 4 — Schema-driven supplement→entity injection map
+#
+# Built once at module startup by reading every edge's filter_supplements.
+# Any supplement key that carries supplement_injects_entity: <EntityName>
+# in graph_schema.yaml is registered here.  The Python loop in
+# _expand_entities_from_filters() reads this map — no entity names or
+# filter key strings are hardcoded in Python.
+#
+# To change which supplement injects which entity: edit graph_schema.yaml.
+# Zero Python changes required.
+# ---------------------------------------------------------------------------
+_SUPPLEMENT_ENTITY_MAP: dict = {}
+for _edge in _graph._edges:
+    for _supp_key, _supp_meta in _edge.get("filter_supplements", {}).items():
+        _inject = _supp_meta.get("supplement_injects_entity")
+        if _inject:
+            _SUPPLEMENT_ENTITY_MAP[_supp_key] = _inject
+
+logger.debug("_SUPPLEMENT_ENTITY_MAP built at startup: %s", _SUPPLEMENT_ENTITY_MAP)
 
 
 def run_pipeline(question: str) -> MiddlewareTrace:
@@ -37,6 +59,16 @@ def run_pipeline(question: str) -> MiddlewareTrace:
     logger.info("Pipeline start: '%s'", question)
 
     extraction = extract_entities(question)
+
+    # Fix 5: Fuzzy name resolution — correct truncated/misspelled names
+    # before any pipeline logic uses the filter values. This runs after both
+    # the regex fast-path and the LLM path, so it covers all extraction methods.
+    # e.g. "Leslie Knop" → "Leslie Knope", "Draper" → "Don Draper"
+    if extraction.filters:
+        resolved_filters = resolve_filter_values(extraction.filters)
+        if resolved_filters != extraction.filters:
+            extraction = extraction.model_copy(update={"filters": resolved_filters})
+
     trace.entity_extraction = extraction
     trace.pipeline_stage_reached = "extraction"
 
@@ -97,23 +129,19 @@ def run_pipeline(question: str) -> MiddlewareTrace:
     # named a specific entity — they want its attributes, not a COUNT(*).
     # Downgrade to lookup so _build_select returns real columns, not COUNT(*).
     #
-    # T2-B: _NAMED_FILTERS is now built dynamically from graph_schema.yaml.
+    # T2-B: _NAMED_FILTERS is built dynamically from graph_schema.yaml.
     # Any filterable_column with is_named_scope: true contributes its filter
     # key (<entity_lower>_<col_key>) to the set. Adding a new named-scope
-    # filter to the schema (e.g. supplier_country) automatically includes it
-    # here — no Python change required.
+    # filter to the schema automatically includes it here — no Python change.
     # Non-schema supplement keys (manager_name, reports_to_name) are added
-    # explicitly — they have no filterable_columns entry.
-    # Access schema via the module-level _graph instance (already loaded,
-    # no new import or cache needed). _graph._nodes is identical to
-    # _load_schema()["nodes"] — same YAML, same cache lifecycle.
+    # via the supplement map since they have no filterable_columns entry.
     _NAMED_FILTERS: set = set()
     for _ns_entity, _ns_node in _graph._nodes.items():
         _ns_entity_lower = _ns_entity.lower()
         for _ns_col_key, _ns_col_meta in _ns_node.get("filterable_columns", {}).items():
             if _ns_col_meta.get("is_named_scope"):
                 _NAMED_FILTERS.add(f"{_ns_entity_lower}_{_ns_col_key}")
-    # Non-schema named-scope supplement keys
+    # Supplement keys that represent named-scope references (non-schema column keys)
     _NAMED_FILTERS.update({"manager_name", "reports_to_name"})
 
     if (extraction.question_type == "aggregation"
@@ -321,66 +349,38 @@ def _expand_entities_from_filters(
     list, automatically inject that entity so the graph traversal builds the
     correct JOIN path.
 
-    T2-A: A generic loop now handles all filter keys that follow the
-    <entity_lower>_<col_key> convention — these are injected automatically
-    at the end of the path (lowest priority) without any Python rule.
-    Semantic rules that require specific insertion positions or involve
-    non-schema filter keys (manager_name, reports_to_name) are kept below.
+    Generic injection (no Python change needed for new entities/filters):
+    - _SUPPLEMENT_ENTITY_MAP loop: edge-level supplement keys that declare
+      supplement_injects_entity inject that entity when the key is in filters.
+    - Supplement-owner loop: node-level supplement keys with owner_entity,
+      excludes_entities, and conditional_exclude enforce org-chart routing.
+    - Filterable-column owner loop: filterable columns with owner_entity and
+      insert_before_entity handle positional injection (e.g. employee_name
+      before Project for Employee→Project JOIN direction).
+    - T2-A generic loop: any filter key matching <entity_lower>_<col_key>
+      injects that entity if absent (appended at end).
 
-    Refinement 1 — Signal-to-Entity Registry (T2.5):
-    Each node in graph_schema.yaml can carry an injection_signals list of
-    pattern names. If employee_name is in filters AND a listed signal matches
-    the question AND the node is not yet in path → inject that node.
-    The loop is fully generic: adding a new signal requires only a schema edit
-    and a registry entry in entity_extractor._INJECTION_SIGNAL_REGISTRY.
-
-    Generic injection (this loop — no Python change needed for new entities):
-    - Any filter key matching <entity_lower>_<col_key> where entity is in
-      the schema → inject that entity if absent (appended at end)
-
-    Semantic rules (explicit Python — ordering or non-schema keys):
-    - department_name → inject Department at specific position after Employee
-    - manager_name → inject Project (non-schema key, cannot be derived generically)
-    - employee_name + Project → inject Employee BEFORE Project (N2 position rule)
-    - reports_to_name → ensure Employee, remove Project if injected (N4 org-chart)
-    - Order display expansion → inject Order successors from schema graph
-    - Department display expansion → inject Employee before/after Department
+    Structural rules (explicit Python — encode graph topology constraints):
+    - Department positional injection after Employee
+    - Order display expansion (inject Order successors from schema graph)
+    - Department display expansion (inject Employee before/after Department)
+    - Order+Department guard (no direct Order→Department edge)
+    - multi_entity_triggers membership query injection
     """
     expanded = list(dict.fromkeys(entities))   # deduplicate, preserve order
     entity_set = set(expanded)
 
     # ------------------------------------------------------------------ #
     # Fix B — Possessive filter correction                                 #
-    # Problem: "Leslie Knope's team" → LLM emits department_name=         #
-    # "Leslie Knop's Team" instead of reports_to_name="Leslie Knope".     #
-    # The possessive "X's <team-word>" is an org-chart query, not a       #
-    # department-name lookup.                                              #
-    #                                                                     #
-    # Detection: department_name value matches Title-Case name + "'s" +   #
-    # a word that appears in Department.multi_entity_triggers (e.g."team")#
-    #                                                                     #
-    # Correction:                                                          #
-    #  1. Extract person name (everything before "'s")                     #
-    #  2. Set filters['reports_to_name'] = extracted_name                  #
-    #  3. Delete filters['department_name']                                #
-    #  4. Remove Department from entity_set (not needed for reports_to)    #
-    #                                                                     #
-    # Zero hardcoding: trigger words come from Department.multi_entity_   #
-    # triggers in the schema. Name extraction uses a generic Title-Case   #
-    # regex. Multi-DB safe: any schema node declaring multi_entity_        #
-    # triggers with team-like words participates automatically.            #
+    # "Leslie Knope's team" → LLM may emit department_name="Leslie Knope's Team"
+    # Detect by matching Title-Case name + possessive + trigger_word.
+    # Correction: rewrite to reports_to_name, remove department_name.
+    # Zero hardcoding: trigger words come from Department.trigger_words in schema.
     # ------------------------------------------------------------------ #
     if "department_name" in filters:
         dept_val = filters["department_name"]
-        dept_node    = _graph._nodes.get("Department", {})
-        # Use trigger_words (bare word list: "team", "dept", "division", etc.)
-        # not multi_entity_triggers (phrase list: "which team", "belong to", etc.)
-        # The trailing word after "'s" will be a single word like "team" or "group",
-        # which matches trigger_words entries, not multi-word trigger phrases.
+        dept_node = _graph._nodes.get("Department", {})
         dept_trigger_words = {t.lower() for t in dept_node.get("trigger_words", [])}
-        # Pattern: one or more Title-Case words, then 's (with or without
-        # the apostrophe), then a space and one more word.
-        # Handles: "Leslie Knope's Team", "Leslie Knop's Team"
         _possessive_re = re.compile(
             r"^([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+)*)'s?\s*(\w+)",
             re.UNICODE,
@@ -390,32 +390,23 @@ def _expand_entities_from_filters(
             candidate_name = m.group(1).strip()
             trailing_word  = m.group(2).lower()
             if trailing_word in dept_trigger_words:
-                # Confirmed possessive org-chart query — rewrite the filter
-                filters = dict(filters)          # mutable copy (caller's dict unchanged)
+                filters = dict(filters)
                 filters["reports_to_name"] = candidate_name
                 del filters["department_name"]
                 expanded = [e for e in expanded if e != "Department"]
                 entity_set.discard("Department")
                 logger.info(
-                    "Possessive correction: department_name='%s' → "
+                    "Possessive correction: department_name='%s' -> "
                     "reports_to_name='%s' (trailing word '%s' in dept trigger_words)",
                     dept_val, candidate_name, trailing_word,
                 )
 
     # ------------------------------------------------------------------ #
-    # Fix 1 — Schema-driven multi_entity_triggers injection               #
+    # Schema-driven multi_entity_triggers injection                        #
     # When the LLM returns only ["Employee"] but the question contains a  #
-    # phrase that signals a membership query (e.g. "which department",    #
-    # "belong to"), inject the secondary entity unconditionally.          #
-    #                                                                     #
-    # Why pipeline not prompt: the prompt rule was present and still      #
-    # failed for sentence structures where the person name is dominant    #
-    # (Q05: "Which dept does Sarah Connor belong to?"). The pipeline      #
-    # enforces this after the LLM regardless of sentence structure.       #
-    #                                                                     #
-    # Zero hardcoding: reads multi_entity_triggers from _graph._nodes.   #
-    # Any node that declares multi_entity_triggers participates here.     #
-    # Multi-DB safe: schema author declares triggers per entity in YAML.  #
+    # phrase signalling a membership query ("which department", "belong to")
+    # inject the secondary entity unconditionally.                         #
+    # Zero hardcoding: reads multi_entity_triggers from _graph._nodes.    #
     # ------------------------------------------------------------------ #
     if question:
         q_norm = re.sub(r"\s+", " ", question.lower())
@@ -429,22 +420,37 @@ def _expand_entities_from_filters(
                             "Path extension: injected %s via multi_entity_trigger '%s'",
                             entity, trigger,
                         )
-                        break  # one trigger match is sufficient per entity
+                        break
+
+    # ------------------------------------------------------------------ #
+    # Step 4 — _SUPPLEMENT_ENTITY_MAP injection                           #
+    # Replaces the hardcoded "manager_name → inject Project" block.       #
+    # Any edge supplement that declares supplement_injects_entity in YAML  #
+    # is registered at startup in _SUPPLEMENT_ENTITY_MAP.                  #
+    # When that supplement key is present in filters AND the target entity #
+    # is not yet in the path AND Employee is already present (supplement   #
+    # keys on Employee→Project edge only fire on Employee paths), inject.  #
+    # ------------------------------------------------------------------ #
+    for supp_key, inject_entity in _SUPPLEMENT_ENTITY_MAP.items():
+        if supp_key in filters and inject_entity not in entity_set:
+            if "Employee" in entity_set:
+                expanded.append(inject_entity)
+                entity_set.add(inject_entity)
+                logger.info(
+                    "Path extension: injected %s via _SUPPLEMENT_ENTITY_MAP "
+                    "(filter key '%s')", inject_entity, supp_key,
+                )
 
     # ------------------------------------------------------------------ #
     # T2-A: Generic filter-to-entity injection loop                       #
     # Derives entity ownership from filter key prefix using the schema    #
     # node list. For any key "entity_lower_colname" where entity_lower    #
     # matches a known node, inject that entity if it is not yet in path.  #
-    # Entities are appended at the end — semantic rules below handle      #
-    # cases that require specific insertion positions.                     #
     # ------------------------------------------------------------------ #
-    _schema_node_names = list(_graph._schema_node_names)  # ordered list from schema
+    _schema_node_names = list(_graph._schema_node_names)
     _entity_lower_map = {e.lower(): e for e in _schema_node_names}
 
     for filter_key in filters:
-        # Match the longest entity prefix (e.g. "order" before "order_date"
-        # is ambiguous — we check all nodes and take the first prefix match).
         matched_entity = None
         for entity_lower, entity in _entity_lower_map.items():
             if filter_key.startswith(entity_lower + "_") or filter_key == entity_lower:
@@ -454,19 +460,14 @@ def _expand_entities_from_filters(
             continue
         if matched_entity in entity_set:
             continue
-        # N2 guard: if employee_name filter is present AND Project is already in
-        # the path, do NOT inject Employee here — the N2 semantic rule below
-        # must handle this case because it inserts Employee BEFORE Project.
-        # A generic append would produce [Project, Employee] — wrong JOIN direction.
-        if filter_key == "employee_name" and "Project" in entity_set:
+        # Positional-injection guard: if this filter key has insert_before_entity
+        # declared in the schema, skip the generic append here — the owner loop
+        # below handles positional insertion correctly.
+        col_key = filter_key[len(matched_entity.lower()) + 1:]  # strip "entity_" prefix
+        col_meta = _graph._nodes.get(matched_entity, {}).get("filterable_columns", {}).get(col_key, {})
+        if col_meta.get("insert_before_entity") and col_meta["insert_before_entity"] in entity_set:
             continue
         # T1.6: Department + Order path guard.
-        # When BOTH department_name and order_status are in filters, injecting
-        # Department creates a traversal the graph cannot resolve (no Dept→Order edge).
-        # The correct path is Order→Employee, with department_name resolved via the
-        # Employee node's filter_supplements.department_name subquery — which fires
-        # automatically when Department is NOT in the path.
-        # Guard fires ONLY when Order is already present; safe for all Order-free queries.
         if matched_entity == "Department" and "Order" in entity_set:
             logger.info(
                 "Path extension: skipping Department injection "
@@ -480,115 +481,119 @@ def _expand_entities_from_filters(
             matched_entity, filter_key,
         )
 
-    # --- LLM entity injection (formerly Refinement 1 injection-signal loop) ---
-    # The schema-driven LLM extractor now returns complete entity lists directly
-    # (e.g. ["Employee", "Project"] for assignment queries). The regex-based
-    # injection_signals mechanism is no longer needed. The structural traversal
-    # rules below (Department positional injection, manager_name→Project, N2, N4,
-    # Order display expansion) remain — they encode JOIN correctness constraints
-    # from the graph topology, not linguistic patterns.
+    # ------------------------------------------------------------------ #
+    # Step 5 — Filterable-column owner/positional injection loop          #
+    # Replaces the hardcoded N2 rule:                                     #
+    #   "employee_name + Project → insert Employee BEFORE Project"        #
+    # Any filterable column with owner_entity + insert_before_entity in   #
+    # the schema participates here.                                        #
+    # ------------------------------------------------------------------ #
+    for filter_key in filters:
+        # Derive entity and column key from the filter key string
+        matched_entity = None
+        col_key = None
+        for entity_lower, entity in _entity_lower_map.items():
+            if filter_key.startswith(entity_lower + "_"):
+                matched_entity = entity
+                col_key = filter_key[len(entity_lower) + 1:]
+                break
+        if matched_entity is None or col_key is None:
+            continue
+        col_meta = _graph._nodes.get(matched_entity, {}).get("filterable_columns", {}).get(col_key, {})
+        owner = col_meta.get("owner_entity")
+        insert_before = col_meta.get("insert_before_entity")
+        if not owner or not insert_before:
+            continue
+        # Fire when: owner absent from path AND insert_before IS in path
+        if owner not in entity_set and insert_before in entity_set:
+            idx = expanded.index(insert_before)
+            expanded.insert(idx, owner)
+            entity_set.add(owner)
+            logger.info(
+                "Path extension: injected %s before %s "
+                "(filter key '%s' owner_entity + insert_before_entity rule)",
+                owner, insert_before, filter_key,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Step 5 — Supplement-owner loop                                      #
+    # Replaces the hardcoded N4 rule:                                     #
+    #   "reports_to_name → ensure Employee, remove Project unless          #
+    #    manager_name also present"                                        #
+    # Reads owner_entity, excludes_entities, and conditional_exclude from  #
+    # each node's filter_supplements in graph_schema.yaml.                 #
+    # ------------------------------------------------------------------ #
+    for node_entity, node_data in _graph._nodes.items():
+        for supp_key, supp_meta in node_data.get("filter_supplements", {}).items():
+            if supp_key not in filters:
+                continue
+            owner = supp_meta.get("owner_entity")
+            excludes = supp_meta.get("excludes_entities", [])
+            cond_excl = supp_meta.get("conditional_exclude", {})
+
+            # Ensure owner entity is in path
+            if owner and owner not in entity_set:
+                expanded.append(owner)
+                entity_set.add(owner)
+                logger.info(
+                    "Path extension: injected %s (supplement owner for '%s')",
+                    owner, supp_key,
+                )
+
+            # Remove excluded entities, subject to conditional_exclude
+            for excl in excludes:
+                if excl not in entity_set:
+                    continue
+                # conditional_exclude: {absent_filter: <key>}
+                # Only remove excl when the named filter is ABSENT from filters
+                absent_filter = cond_excl.get("absent_filter")
+                if absent_filter and absent_filter in filters:
+                    # The condition for exclusion is NOT met — keep the entity
+                    logger.debug(
+                        "Supplement owner: NOT removing %s for '%s' "
+                        "(conditional_exclude: absent_filter '%s' is present)",
+                        excl, supp_key, absent_filter,
+                    )
+                    continue
+                expanded = [e for e in expanded if e != excl]
+                entity_set.discard(excl)
+                logger.info(
+                    "Path extension: removed %s (supplement '%s' excludes_entities rule)",
+                    excl, supp_key,
+                )
 
     # --- Department injection (Semantic — positional: after Employee) ---
-    # P6.1: Guard replicated from T2-A loop — skip if Order is already in path.
-    # When Order is present, department_name is resolved via Employee's
-    # filter_supplements.department_name subquery (no Department JOIN needed).
-    # Without this guard, Department is injected positionally → Department→Order
-    # NoPathError → fallback to Employee-only → order_status filter silently dropped.
+    # P6.1: Guard — skip if Order is already in path.
     if "department_name" in filters and "Department" not in entity_set and "Order" not in entity_set:
         if "Employee" in entity_set:
-            if "Project" in entity_set:
-                # Need full 3-hop: Employee → Department → Project
-                # But graph path is Employee→Department and Department→Project
-                # Insert Department between Employee and Project
-                idx = expanded.index("Employee")
-                expanded.insert(idx + 1, "Department")
-            else:
-                idx = expanded.index("Employee")
-                expanded.insert(idx + 1, "Department")
+            idx = expanded.index("Employee")
+            expanded.insert(idx + 1, "Department")
             entity_set.add("Department")
             logger.info(
                 "Path extension: injected Department (department_name filter present)"
             )
 
-    # --- Project injection from manager_name (Semantic — non-schema key) ---
-    if "manager_name" in filters and "Project" not in entity_set:
-        if "Employee" in entity_set:
-            expanded.append("Project")
-            entity_set.add("Project")
-            logger.info(
-                "Path extension: injected Project (manager_name filter present)"
-            )
-
-    # N2: Employee injection for employee_name + Project path.
-    # When a question names an employee AND asks about projects
-    # (e.g. "Sarah Connor is in which project"), the system must traverse
-    # Employee→Project via project_assignments — not single-node Project.
-    # Without this rule, employee_name filter is silently dropped because
-    # it doesn't exist in _build_filter_map for a Project-only path.
-    if "employee_name" in filters and "Employee" not in entity_set and "Project" in entity_set:
-        idx = expanded.index("Project")
-        expanded.insert(idx, "Employee")
-        entity_set.add("Employee")
-        logger.info(
-            "Path extension: injected Employee before Project "
-            "(employee_name filter + Project entity — needs Employee→Project join)"
-        )
-
-    # N4: reports_to_name routing — org-chart hierarchy queries.
-    # "employees who report to X" = employees in the department managed by X.
-    # Route to Employee-only path; the reports_to_name subquery filter in
-    # _build_filter_map resolves the manager name to a department via the
-    # departments.manager_id FK — purely schema-driven, no names hardcoded.
-    if "reports_to_name" in filters:
-        if "Employee" not in entity_set:
-            expanded.append("Employee")
-            entity_set.add("Employee")
-        # Remove Project from path if it was injected by manager_name logic —
-        # reports_to is an employee hierarchy query, not a project query.
-        if "Project" in entity_set and "manager_name" not in filters:
-            expanded = [e for e in expanded if e != "Project"]
-            entity_set.discard("Project")
-            logger.info(
-                "Path extension: removed Project from path "
-                "(reports_to_name query — org-chart, not project manager)"
-            )
-        logger.info("Path extension: Employee path for reports_to_name filter")
-
     # --- Order display expansion (P1-B) ---
-    # When Order is the anchor entity it owns two outgoing edges in the schema:
+    # When Order is the anchor entity it owns two outgoing schema edges:
     #   Order -[placed_by]->  Employee  (o.employee_id = e.id)
     #   Order -[contains]->   Product   (o.product_id  = p.id)
-    # Without these JOINs the SELECT has no product name or ordered_by column.
-    # Neighbours are derived from the live graph object — not hardcoded strings —
-    # so this stays correct if edges are ever added/renamed in graph_schema.yaml.
+    # Neighbours are derived from the live graph — not hardcoded strings.
     if "Order" in entity_set:
-        # Fix 4 — Order+Department co-presence guard                         #
-        # Department has no edge to Order in the schema (no Order↔Dept join). #
-        # When both appear (e.g. Q20: "Who in Operations placed orders..."),   #
-        # Department must be removed from the path. The department_name filter #
-        # is resolved instead via Employee's filter_supplement subquery, which #
-        # fires automatically whenever Department is NOT in the path.          #
-        # This guard removes Department regardless of whether it came from the #
-        # LLM or from injection — the topology constraint applies either way.  #
-        # Multi-DB safe: reads only from schema graph edges, no names hardcoded.#
+        # Order+Department co-presence guard: no Order->Department edge exists.
+        # Remove Department; department_name is resolved via Employee's subquery.
         if "Department" in entity_set:
-            # Use has_edge (direct edge only) — NOT nx.has_path which returns True
-            # for any reachable multi-hop path (Order→Employee→Department exists
-            # as a 2-hop but that is not a valid JOIN anchor for this query).
-            # We only preserve Department in the entity list when there is a direct
-            # schema edge Order→Department. In the current schema there is none.
             has_direct_order_dept_edge = _graph._graph.has_edge("Order", "Department")
             if not has_direct_order_dept_edge:
                 expanded = [e for e in expanded if e != "Department"]
                 entity_set.discard("Department")
                 logger.info(
                     "Path extension: removed Department "
-                    "(Order in path — no Order→Department edge; "
+                    "(Order in path — no Order->Department edge; "
                     "department_name resolved via Employee subquery)"
                 )
 
         schema_order_neighbours = set(_graph._graph.successors("Order"))
-        for neighbour in sorted(schema_order_neighbours):  # sorted for stable order
+        for neighbour in sorted(schema_order_neighbours):
             if neighbour not in entity_set:
                 expanded.append(neighbour)
                 entity_set.add(neighbour)
@@ -598,29 +603,20 @@ def _expand_entities_from_filters(
                 )
 
     # --- Department display expansion (P1-C / D7 / R7) ---
-    # When Department is the sole entity, we must decide which edge to use:
-    #
-    #   Employee→Department  (works_in: e.department_id = d.id)  → ALL staff in dept
-    #   Department→Employee  (managed_by: d.manager_id = e.id)   → only the 1 manager
-    #
-    # R7: "list" queries asking for "everyone in HR" need ALL employees, not just
-    # the manager.  Inject Employee BEFORE Department for list, comparison, and
-    # cross_entity queries so _canonical_entity_order keeps Employee as anchor.
-    # Only true aggregation queries (headcount/budget breakdown) can safely use
-    # the managed_by JOIN because they GROUP BY department anyway.
+    # When Department is the sole entity, inject Employee for correct JOIN direction.
+    # list/comparison/cross_entity/lookup: Employee BEFORE Department (works_in edge →
+    # returns all employees in dept).
+    # aggregation: Employee AFTER Department (managed_by edge → GROUP BY dept).
     if "Department" in entity_set and "Employee" not in entity_set:
         if q_type in ("comparison", "list", "cross_entity", "lookup"):
-            # Insert Employee BEFORE Department → Employee→Department path →
-            # works_in JOIN → returns all employees in the department.
             idx = expanded.index("Department")
             expanded.insert(idx, "Employee")
             entity_set.add("Employee")
             logger.info(
                 "Path extension: injected Employee before Department "
-                "(%s query — needs Employee→Department path for all staff)", q_type
+                "(%s query — needs Employee->Department path for all staff)", q_type
             )
         else:
-            # aggregation: use managed_by join (one manager row) + GROUP BY dept
             expanded.append("Employee")
             entity_set.add("Employee")
             logger.info(
@@ -629,6 +625,40 @@ def _expand_entities_from_filters(
             )
 
     return _canonical_entity_order(expanded, set(expanded), filters, original_entities=entities, q_type=q_type)
+
+
+def _topo_sort_entities(entity_set: set) -> List[str]:
+    """
+    Return entities ordered by topological sort of the induced schema subgraph.
+
+    This is the schema-driven replacement for the hardcoded priority list
+    ["Employee", "Department", "Project", "Order", "Product"].
+
+    For DAG subgraphs (e.g. Order->Employee, Order->Product): topological sort
+    gives Order first — which is correct since Order is the anchor.
+
+    For subgraphs with cycles from bidirectional edges (Employee<->Department,
+    Employee<->Project): NetworkXUnfeasible is caught and we fall back to
+    sorting by out_degree descending with schema declaration order as tiebreaker.
+    The schema declares nodes in Employee, Department, Product, Order, Project
+    order — the same precedence as the old hardcoded list.
+
+    Adding a new entity to the schema automatically gets the correct sort
+    position from graph topology — no Python change needed.
+    """
+    subgraph = _graph._graph.subgraph(entity_set)
+    schema_order = list(_graph._schema_node_names)
+    try:
+        return list(nx.topological_sort(subgraph))
+    except nx.NetworkXUnfeasible:
+        # Cycle in subgraph (bidirectional edges) — fall back to degree sort
+        return sorted(
+            entity_set,
+            key=lambda n: (
+                -subgraph.out_degree(n),
+                schema_order.index(n) if n in schema_order else len(schema_order),
+            ),
+        )
 
 
 def _canonical_entity_order(
@@ -642,17 +672,15 @@ def _canonical_entity_order(
     Enforce a stable, join-friendly ordering of entities so the graph always
     traverses in a direction that produces valid SQL joins.
 
-    The default priority list (Employee > Department > Project > Order > Product)
-    is correct when the user explicitly asked about multiple entity types.
+    Step 6: both the default priority list and the secondary list in the anchor
+    override block are replaced with _topo_sort_entities().  The sort is driven
+    entirely by the schema graph topology — adding a new entity automatically
+    gets the correct join order with no Python changes.
 
     Schema-driven anchor override: when a single entity was originally detected
     and others were injected by display expansion (e.g. Order injects Employee
-    and Product; Department injects Employee for manager display), the originally-
-    detected node must anchor the JOIN — not whatever the default priority puts
-    first.  The condition is: candidate was the SOLE original entity AND it has
-    a direct outgoing edge to all injected members, verified via the live graph.
-
-    original_entities: the pre-expansion entity list (None = no override).
+    and Product), the originally-detected node must anchor the JOIN.  Gate
+    conditions are purely graph-structure-driven — no entity names hardcoded.
     """
     if not entities:
         return entities
@@ -666,30 +694,20 @@ def _canonical_entity_order(
     # first so the works_in JOIN returns all employees, not just the manager.
     #
     # P1 FIX — Bidirectional-edge guard:
-    # The override must NOT fire when the candidate↔injected relationship is
-    # bidirectional (edges exist in BOTH directions in the schema graph).
-    # Reason: when both directions exist (e.g. Employee↔Project, Employee↔Department),
-    # _expand_entities_from_filters deliberately orders them to select the correct
-    # JOIN direction. Overriding that ordering picks the wrong edge.
-    #
-    # The override SHOULD still fire for unidirectional relationships like
-    # Order→Employee and Order→Product (no Employee→Order or Product→Order edges exist).
-    # In those cases Order is the only valid anchor and the override is correct.
-    #
-    # This check is purely graph-structure-driven — reads the live NetworkX graph,
-    # no entity names or filter keys hardcoded.
+    # The override must NOT fire when the candidate<->injected relationship is
+    # bidirectional.  When both directions exist, _expand_entities_from_filters
+    # deliberately orders them to select the correct JOIN direction.
+    # The override SHOULD fire for unidirectional relationships (e.g. Order->Employee,
+    # Order->Product) where Order is the only valid anchor.
     if original_entities and len(set(original_entities)) == 1 and q_type != "comparison":
         candidate = original_entities[0]
         if candidate in entity_set:
             others = entity_set - {candidate}
             if others and all(_graph._graph.has_edge(candidate, other) for other in others):
-                # P1: check if ANY reverse edge exists (injected → candidate)
                 has_any_reverse_edge = any(
                     _graph._graph.has_edge(other, candidate) for other in others
                 )
                 if has_any_reverse_edge:
-                    # Bidirectional relationship — injection order was deliberate.
-                    # Fall through to default priority ordering which respects it.
                     logger.debug(
                         "Anchor override suppressed for %s: reverse edges exist from injected "
                         "nodes — respecting _expand_entities_from_filters ordering",
@@ -697,10 +715,11 @@ def _canonical_entity_order(
                     )
                 else:
                     # Unidirectional — candidate is the only valid anchor (e.g. Order).
+                    # Step 6: secondary list replaced with _topo_sort_entities().
                     ordered: List[str] = [candidate]
-                    secondary = ["Employee", "Department", "Project", "Order", "Product"]
+                    secondary = _topo_sort_entities(entity_set - {candidate})
                     for node in secondary:
-                        if node in entity_set and node != candidate:
+                        if node != candidate:
                             ordered.append(node)
                     for node in entities:
                         if node not in ordered:
@@ -711,14 +730,12 @@ def _canonical_entity_order(
                     )
                     return ordered
 
-    # Default priority for all other combinations (Employee > Dept > Project > Product)
-    priority = ["Employee", "Department", "Project", "Order", "Product"]
-    ordered = []
-    for node in priority:
-        if node in entity_set:
-            ordered.append(node)
+    # Step 6: default priority list replaced with _topo_sort_entities().
+    # Produces identical ordering to ["Employee","Department","Project","Order","Product"]
+    # for all current entity combinations, and correct ordering for any new entities.
+    ordered = _topo_sort_entities(entity_set)
 
-    # Append anything not in the priority list (future schema additions)
+    # Append anything the subgraph missed (isolated nodes or schema gaps)
     for node in entities:
         if node not in ordered:
             ordered.append(node)

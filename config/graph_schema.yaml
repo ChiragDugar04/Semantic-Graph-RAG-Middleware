@@ -4,16 +4,6 @@ nodes:
     table: employees
     alias: e
     display_name: "Employee"
-    trigger_words:
-      - employee
-      - employees
-      - staff
-      - worker
-      - workers
-      - person
-      - people
-      - who
-      - member
 
     selectable_columns:
       - column: name
@@ -34,51 +24,32 @@ nodes:
         alias: email
         label: "Email"
         default_hidden: true
+
     filterable_columns:
       name:
         match_type: like
         sql_column: e.name
         is_named_scope: true
-        # owner_entity + insert_before_entity: when employee_name is in filters and
-        # Project is already in the entity set, inject Employee BEFORE Project so the
-        # graph traverses Employee->Project (correct JOIN direction), not Project alone.
-        # Read by pipeline._expand_entities_from_filters() supplement-owner loop.
         owner_entity: Employee
         insert_before_entity: Project
       role:
         match_type: like
         sql_column: e.role
         is_optional_filter: true
-        disambiguation_note: "job title queries only (e.g. Senior Engineer, Analyst). For team/group membership use department_name."
       salary:
         match_type: exact
         sql_column: e.salary
-    role_suffixes:
-      - engineer
-      - manager
-      - analyst
-      - coordinator
-      - director
-      - specialist
-      - representative
-      - advisor
-      - consultant
-      - developer
-      - architect
-      - lead
-      - officer
-      - executive
-      - associate
-      - technician
-      - administrator
-      - supervisor
-      - copywriter
-      - strategist
-      - liaison
+        is_numeric: true
+        scalar_subquery_defaults:
+          scalar_sql: "(SELECT AVG(salary) FROM employees)"
+          above_operator: ">"
+          below_operator: "<"
+
     primary_key: id
     primary_key_sql: e.id
+
     empty_result_hint: "No employees were found matching your criteria. Please check the name, department, or role and try again."
-    empty_result_keywords: [who, employee, employees, staff, worker, workers, person, people, member]
+
     default_sort:
       comparison:
         column: e.salary
@@ -93,63 +64,78 @@ nodes:
         direction: ASC
       lookup:
         limit: 10
+
     aggregation_defaults:
       group_anchor: false
       count_column: e.id
+      sum_columns: [e.salary]
       avg_columns: [e.salary]
       max_columns: [e.salary]
       min_columns: [e.salary]
-    # T1-D: node-level filter supplements.
+
+    group_rank_defaults:
+      group_by_column: e.department_id
+      group_by_alias: department_id
+      count_column: e.id
+      count_alias: employee_count
+      extra_select:
+        - "(SELECT d2.name FROM departments d2 WHERE d2.id = e.department_id) AS department_name"
+      order_direction: DESC
+      limit: 10
+
+    having_count_defaults:
+      join_entity: Project
+      join_sql: "INNER JOIN project_assignments pa ON e.id = pa.employee_id INNER JOIN projects proj ON pa.project_id = proj.id"
+      count_sql: "COUNT(DISTINCT proj.id)"
+      count_alias: project_count
+      label_sql: "e.name"
+      label_alias: employee_name
+      extra_select:
+        - "e.role AS employee_role"
+        - "d.name AS department_name"
+      extra_joins:
+        - "INNER JOIN departments d ON e.department_id = d.id"
+      default_threshold: 1
+      threshold_signals:
+        "one": 1
+        "two": 2
+        "three": 3
+        "four": 4
+        "five": 5
+        "1": 1
+        "2": 2
+        "3": 3
+        "4": 4
+        "5": 5
+
+    delta_defaults:
+      - column_sql: "e.salary"
+        column_alias: salary
+        max_alias: highest_salary
+        min_alias: lowest_salary
+        delta_alias: salary_gap
+        is_currency: true
+
     filter_supplements:
       reports_to_name:
         sql: "e.department_id IN (SELECT d.id FROM departments d INNER JOIN employees mgr ON d.manager_id = mgr.id WHERE mgr.name LIKE %(reports_to_name)s)"
         match: subquery
         exclude_when_node_in_path: []
-        # owner_entity: the entity this supplement key belongs to.
-        # When reports_to_name is in filters, ensure Employee is in the path.
         owner_entity: Employee
-        # excludes_entities: remove these from the path when this supplement fires.
-        # reports_to is an org-chart query, not a project query.
         excludes_entities: [Project]
-        # conditional_exclude: only apply excludes_entities when the named filter
-        # is ABSENT from the current filters dict.
-        # "remove Project ONLY IF manager_name is not also present" — if both
-        # reports_to_name and manager_name are in filters, keep Project.
         conditional_exclude:
           absent_filter: manager_name
-        semantic_signals:
-          - "X's team"
-          - "team of X"
-          - "under X"
-          - "who reports to X"
-          - "direct reports of X"
-          - "everyone under X"
-          - "people under X"
-          - "reports to X"
       department_name:
         sql: "e.department_id IN (SELECT id FROM departments WHERE name LIKE %(department_name)s)"
         match: subquery
         exclude_when_node_in_path: [Department]
-        # owner_entity: when department_name supplement fires (Employee path, no Dept node),
-        # Employee must already be in path (it is, since this supplement lives on Employee).
         owner_entity: Employee
-        semantic_signals:
-          - "employees in"
-          - "people in"
-          - "staff in"
-          - "workers in"
+
 
   Department:
     table: departments
     alias: d
     display_name: "Department"
-    trigger_words:
-      - department
-      - departments
-      - dept
-      - team
-      - division
-      - group
     multi_entity_triggers:
       - "which department"
       - "what department"
@@ -161,6 +147,7 @@ nodes:
       - "is on which"
       - "in which department"
       - "in which team"
+
     selectable_columns:
       - column: name
         alias: department_name
@@ -173,6 +160,11 @@ nodes:
         alias: location
         label: "Location"
         default_hidden: true
+      - column: "(SELECT e2.name FROM employees e2 WHERE e2.id = d.manager_id)"
+        alias: manager_name
+        label: "Department Manager"
+        is_subquery: true
+
     filterable_columns:
       name:
         match_type: like
@@ -182,39 +174,45 @@ nodes:
       budget:
         match_type: exact
         sql_column: d.budget
+        is_numeric: true
       location:
         match_type: like
         sql_column: d.location
+
     primary_key: id
     primary_key_sql: d.id
+
     empty_result_hint: "No department was found matching your criteria. Please verify the department name and try again."
-    empty_result_keywords: [department, departments, dept, team, division, group]
+
     aggregation_defaults:
       group_anchor: true
       label_column: d.name
       label_alias: department_name
       group_by_sql: "d.id, d.name"
 
+    group_rank_defaults:
+      group_by_column: d.name
+      group_by_alias: department_name
+      count_column: e.id
+      count_alias: employee_count
+      extra_select: []
+      order_direction: DESC
+      limit: 10
+
+    delta_defaults:
+      - column_sql: "d.budget"
+        column_alias: budget
+        max_alias: highest_budget
+        min_alias: lowest_budget
+        delta_alias: budget_gap
+        is_currency: true
+
+
   Product:
     table: products
     alias: p
     display_name: "Product"
-    trigger_words:
-      - product
-      - products
-      - item
-      - items
-      - stock
-      - inventory
-      - unit
-      - units
-      - electronics
-      - electronic
-      - furniture
-      - office supply
-      - office supplies
-      - supply
-      - supplies
+
     selectable_columns:
       - column: name
         alias: product_name
@@ -233,6 +231,7 @@ nodes:
         alias: supplier
         label: "Supplier"
         default_hidden: true
+
     filterable_columns:
       name:
         match_type: like
@@ -245,22 +244,26 @@ nodes:
         is_optional_filter: true
         valid_values:
           - canonical: "Electronics"
-            synonyms: [electronics, electronic]
           - canonical: "Furniture"
-            synonyms: [furniture]
           - canonical: "Office Supply"
-            synonyms: [office supply, office supplies, supply, supplies]
       price:
         match_type: exact
         sql_column: p.price
+        is_numeric: true
+        scalar_subquery_defaults:
+          scalar_sql: "(SELECT AVG(price) FROM products)"
+          above_operator: ">"
+          below_operator: "<"
       supplier:
         match_type: like
         sql_column: p.supplier
         is_named_scope: true
+
     primary_key: id
     primary_key_sql: p.id
+
     empty_result_hint: "No products were found matching your search. Please check the product name or category and try again."
-    empty_result_keywords: [product, products, item, items, stock, inventory, unit, units, electronics, furniture, supply, supplies]
+
     default_sort:
       comparison:
         column: p.price
@@ -270,17 +273,29 @@ nodes:
         column: p.name
         direction: ASC
 
+    group_rank_defaults:
+      group_by_column: p.supplier
+      group_by_alias: supplier
+      count_column: p.id
+      count_alias: product_count
+      extra_select: []
+      order_direction: DESC
+      limit: 10
+
+    delta_defaults:
+      - column_sql: "p.price"
+        column_alias: price
+        max_alias: highest_price
+        min_alias: lowest_price
+        delta_alias: price_gap
+        is_currency: true
+
+
   Order:
     table: orders
     alias: o
     display_name: "Order"
-    trigger_words:
-      - order
-      - orders
-      - purchase
-      - purchases
-      - bought
-      - ordered
+
     selectable_columns:
       - column: id
         alias: order_id
@@ -294,6 +309,7 @@ nodes:
       - column: status
         alias: status
         label: "Status"
+
     filterable_columns:
       status:
         match_type: exact
@@ -301,26 +317,21 @@ nodes:
         is_optional_filter: true
         enum_values:
           - canonical: "pending"
-            synonyms: [pending]
           - canonical: "processing"
-            synonyms: [processing]
           - canonical: "shipped"
-            synonyms: [shipped]
           - canonical: "delivered"
-            synonyms: [delivered]
           - canonical: "cancelled"
-            synonyms: [cancelled, canceled]
           - canonical: "active"
-            synonyms: [active]
           - canonical: "completed"
-            synonyms: [completed, complete]
       order_date:
         match_type: exact
         sql_column: o.order_date
+
     primary_key: id
     primary_key_sql: o.id
+
     empty_result_hint: "No orders were found matching your criteria. You can try filtering by a different status or date range."
-    empty_result_keywords: [order, orders, purchase, purchases, bought, ordered]
+
     default_sort:
       comparison:
         column: o.order_date
@@ -338,6 +349,7 @@ nodes:
         column: o.order_date
         direction: DESC
         limit: 20
+
     aggregation_defaults:
       group_anchor: true
       label_column: o.status
@@ -346,17 +358,30 @@ nodes:
       count_column: o.id
       sum_columns: [o.quantity]
 
+    group_rank_defaults:
+      group_by_column: o.employee_id
+      group_by_alias: employee_id
+      count_column: o.id
+      count_alias: order_count
+      extra_select:
+        - "(SELECT e2.name FROM employees e2 WHERE e2.id = o.employee_id) AS employee_name"
+      order_direction: DESC
+      limit: 10
+
+    temporal_columns:
+      - column_sql: "o.order_date"
+        column_alias: order_date
+        display_format: date
+        after_operator: ">="
+        before_operator: "<="
+        param_key: order_date_val
+
+
   Project:
     table: projects
     alias: proj
     display_name: "Project"
-    trigger_words:
-      - project
-      - projects
-      - initiative
-      - initiatives
-      - program
-      - programs
+
     selectable_columns:
       - column: name
         alias: project_name
@@ -382,6 +407,7 @@ nodes:
         alias: manager_id_raw
         label: "Manager ID"
         is_hidden: true
+
     filterable_columns:
       name:
         match_type: like
@@ -393,31 +419,48 @@ nodes:
         is_optional_filter: true
         enum_values:
           - canonical: "planning"
-            synonyms: [planning, planned]
           - canonical: "active"
-            synonyms: [active]
           - canonical: "completed"
-            synonyms: [completed, complete]
           - canonical: "on_hold"
-            synonyms: [on_hold, "on hold", paused]
+
     primary_key: id
     primary_key_sql: proj.id
+
     empty_result_hint: "No projects were found matching your criteria. Please check the project name or status filter."
-    empty_result_keywords: [project, projects, initiative, initiatives, program, programs]
+
     default_sort:
       list:
         column: proj.name
         direction: ASC
+
     aggregation_defaults:
       group_anchor: true
       label_column: proj.name
       label_alias: project_name
       group_by_sql: "proj.id, proj.name"
 
+    temporal_columns:
+      - column_sql: "proj.start_date"
+        column_alias: start_date
+        display_format: date
+        after_operator: ">="
+        before_operator: "<="
+        param_key: start_date_val
+      - column_sql: "proj.end_date"
+        column_alias: end_date
+        display_format: date
+        after_operator: ">="
+        before_operator: "<="
+        param_key: end_date_val
 
-# ============================================================
-# EDGES
-# ============================================================
+    delta_defaults:
+      - column_sql: "proj.budget"
+        column_alias: project_budget
+        max_alias: highest_budget
+        min_alias: lowest_budget
+        delta_alias: budget_gap
+        is_currency: true
+
 
 edges:
 
@@ -426,14 +469,12 @@ edges:
     relation: works_in
     join_type: INNER
     join_condition: "e.department_id = d.id"
-    notes: "An employee belongs to exactly one department"
 
   - from_node: Department
     to_node: Employee
     relation: managed_by
     join_type: LEFT
     join_condition: "d.manager_id = e.id"
-    notes: "A department has one manager (an employee). Use alias mgr for manager employee."
     manager_join: true
 
   - from_node: Employee
@@ -445,22 +486,11 @@ edges:
     join_condition: "e.id = pa.employee_id AND pa.project_id = proj.id"
     extra_select:
       - "pa.role_on_project AS assignment_role"
-    notes: "Many-to-many via project_assignments junction table"
     filter_supplements:
       manager_name:
         sql: "proj.manager_id IN (SELECT id FROM employees WHERE name LIKE %(manager_name)s)"
         match: subquery
-        # supplement_injects_entity: when manager_name is in filters, inject Project.
-        # Read by pipeline._SUPPLEMENT_ENTITY_MAP at module startup.
         supplement_injects_entity: Project
-        semantic_signals:
-          - "managed by X"
-          - "X is managing"
-          - "running the"
-          - "who manages"
-          - "who is running"
-          - "X manages"
-          - "managing"
       project_department:
         sql: "proj.department_id IN (SELECT id FROM departments WHERE name LIKE %(project_department)s)"
         match: subquery
@@ -470,113 +500,52 @@ edges:
     relation: managed_by_employee
     join_type: LEFT
     join_condition: "proj.manager_id = mgr.id"
-    notes: "A project has one manager (an employee). Uses alias 'mgr'."
 
   - from_node: Project
     to_node: Department
     relation: owned_by
     join_type: INNER
     join_condition: "proj.department_id = d.id"
-    notes: "A project is owned by a primary department"
 
   - from_node: Department
     to_node: Project
     relation: has_projects
     join_type: INNER
     join_condition: "d.id = proj.department_id"
-    notes: "A department owns multiple projects (reverse of owned_by for graph traversal)"
 
   - from_node: Order
     to_node: Employee
     relation: placed_by
     join_type: INNER
     join_condition: "o.employee_id = e.id"
-    notes: "An order was placed by an employee"
 
   - from_node: Order
     to_node: Product
     relation: contains
     join_type: INNER
     join_condition: "o.product_id = p.id"
-    notes: "An order is for a specific product"
 
-# ============================================================
-# QUERY LIMITS
-# ============================================================
 
 query_limits:
   no_filter_signals:
-    trigger_words:
-      - "most"
-      - "highest"
-      - "lowest"
-      - "least"
-      - "best"
-      - "worst"
-      - "top"
-      - "bottom"
-      - "rank"
-      - "ranked"
-      - "ranking"
-      - "earns the most"
-      - "earns the least"
-      - "most expensive"
-      - "cheapest"
-      - "expensive"
-      - "maximum"
-      - "minimum"
-      - "max"
-      - "min"
     applies_to_fields:
       - employee_salary
       - department_budget
       - project_budget
       - product_price
+
   unsupported_patterns:
-    - description: "HAVING COUNT -- more than N items per group"
-      user_message: "I can't answer questions that need counting across groups (e.g. 'more than one project'). Try asking which projects a specific person is on instead."
-      linguistic_signals:
-        - "more than one"
-        - "more than two"
-        - "more than three"
-        - "assigned to multiple"
-        - "working on more than"
-        - "on more than"
-        - "at least two"
-        - "at least three"
-    - description: "Subquery average comparison"
-      user_message: "I can't compare individual values against a computed average. Try asking for the highest or lowest value directly instead."
-      linguistic_signals:
-        - "more than the average"
-        - "higher than the average"
-        - "above the average"
-        - "below the average"
-        - "cost more than average"
-        - "earn more than average"
-        - "paid more than average"
     - description: "Cross-record temporal comparison"
-      user_message: "I can't compare dates or timelines across different records. Try asking about a specific project's start or end date instead."
-      linguistic_signals:
-        - "started after"
-        - "completed before"
-        - "after the last"
-        - "before the first"
-        - "since the last"
-    - description: "Aggregation by group needing GROUP BY / COUNT"
-      user_message: "I can't group and count across all records. Try asking about a specific supplier or category instead."
-      linguistic_signals:
-        - "which supplier provides the most"
-        - "supplier with the most"
-        - "most products by"
-        - "count by supplier"
-        - "how many products does each"
-        - "rank the suppliers"
-    - description: "Computed difference or delta between two aggregate values"
-      user_message: "I can't compute differences between aggregate values like highest and lowest salary. Try asking for the highest salary and the lowest salary as two separate questions."
-      linguistic_signals:
-        - "difference between"
-        - "salary difference"
-        - "pay difference"
-        - "how much more than"
-        - "how much less than"
-        - "gap between"
+      sql_capability_required: TEMPORAL_CROSS
+      is_now_supported: false
+      user_message: "I can't compare dates between two different records. Try asking about a specific date instead — for example: 'projects started after January 2025'."
+
+    - description: "HAVING COUNT"
+      sql_capability_required: HAVING_COUNT
+      is_now_supported: true
+      supported_as: having_count
+
+    - description: "Computed delta"
+      sql_capability_required: COMPUTED_DELTA
+      is_now_supported: true
+      supported_as: computed_delta

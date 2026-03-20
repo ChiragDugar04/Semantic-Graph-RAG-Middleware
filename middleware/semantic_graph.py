@@ -3,24 +3,18 @@ from __future__ import annotations
 import logging
 import yaml
 import networkx as nx
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
 logger = logging.getLogger(__name__)
-
 
 class EntityNotFoundError(Exception):
     pass
 
-
 class NoPathError(Exception):
     pass
 
-
 class SchemaValidationError(Exception):
     pass
-
 
 class JoinStep:
     def __init__(self, edge_data: Dict[str, Any]) -> None:
@@ -33,7 +27,6 @@ class JoinStep:
         self.junction_alias: Optional[str] = edge_data.get("junction_alias")
         self.extra_select: List[str] = edge_data.get("extra_select", [])
         self.manager_join: bool = edge_data.get("manager_join", False)
-        # T1-D: edge-level cross-table filter supplements (dict of filter_key → {sql, match})
         self.filter_supplements: Dict[str, Any] = edge_data.get("filter_supplements", {})
 
     def __repr__(self) -> str:

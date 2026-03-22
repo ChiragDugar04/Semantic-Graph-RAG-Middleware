@@ -1,14 +1,12 @@
-# ============================================================
-# INTENT REGISTRY
-# Each intent maps a user question category to a safe,
-# pre-written parameterized SQL template.
-# The LLM never writes SQL — it only picks an intent name.
-# ============================================================
-
 intents:
 
   employee_salary:
-    description: "Get salary and role information for a specific employee"
+    description: >
+      Use this ONLY when the question asks about ONE specific named person's
+      salary, pay, earnings, compensation, or role details.
+      Examples: "What is Sarah Connor's salary?", "How much does Alan Turing earn?",
+      "What does Grace Hopper make?", "Tell me John Reese's pay".
+      REQUIRES a person's name in the question.
     sql_template: >
       SELECT e.name, e.role, e.salary, e.hire_date, d.name AS department
       FROM employees e
@@ -20,7 +18,12 @@ intents:
     result_description: "Employee salary and role details"
 
   employee_list:
-    description: "List all employees in a specific department"
+    description: >
+      Use this ONLY when the question asks to LIST or SHOW ALL employees
+      in a specific department or team.
+      Examples: "List all employees in Engineering", "Who works in Sales?",
+      "Show me the Marketing team", "Who is in Operations?".
+      REQUIRES a department name. Do NOT use for a single person.
     sql_template: >
       SELECT e.name, e.role, e.salary, e.hire_date
       FROM employees e
@@ -33,7 +36,12 @@ intents:
     result_description: "List of employees in a department"
 
   department_budget:
-    description: "Get budget, location and headcount for a specific department"
+    description: >
+      Use this ONLY when the question asks about ONE specific department's
+      budget, funding, money, spending, headcount, location, or manager.
+      Examples: "What is the Engineering budget?", "How much money does Marketing have?",
+      "Tell me about the Sales department", "Who manages Operations?".
+      REQUIRES a department name.
     sql_template: >
       SELECT d.name, d.budget, d.location,
              COUNT(e.id) AS headcount,
@@ -49,7 +57,12 @@ intents:
     result_description: "Department budget and headcount info"
 
   department_list:
-    description: "List all departments with their budgets and headcounts"
+    description: >
+      Use this ONLY when the question asks to LIST or SHOW ALL departments
+      in the company — with no specific department name mentioned.
+      Examples: "Show me all departments", "List all departments",
+      "What departments exist?", "Which departments do we have?".
+      Do NOT use if a specific department name is mentioned.
     sql_template: >
       SELECT d.name, d.budget, d.location,
              COUNT(e.id) AS headcount
@@ -62,7 +75,19 @@ intents:
     result_description: "All departments with budget and size"
 
   product_stock:
-    description: "Get stock level and pricing for a specific product"
+    description: >
+      Use this ONLY when the question asks about ONE specific named product's
+      stock level, quantity, inventory, units, price, or supplier.
+      Examples: "How many Laptop Pro 15 units are in stock?",
+      "What is the stock level for Webcam HD?",
+      "How many Ergonomic Chair units do we have?",
+      "What is the price of Standing Desk?",
+      "Tell me about the USB-C Hub stock".
+      REQUIRES a specific product name like Laptop Pro 15, Webcam HD,
+      Standing Desk, Ergonomic Chair, USB-C Hub, Mechanical Keyboard,
+      Monitor 27 inch, Wireless Mouse, Desk Lamp, Notebook Pack,
+      Whiteboard 4x6, Printer Paper A4.
+      Do NOT use if only a category like Electronics or Furniture is mentioned.
     sql_template: >
       SELECT name, category, price, stock_quantity, supplier
       FROM products
@@ -73,7 +98,14 @@ intents:
     result_description: "Product stock and pricing details"
 
   product_list:
-    description: "List all products in a specific category"
+    description: >
+      Use this ONLY when the question asks to LIST or SHOW ALL products
+      in a CATEGORY — not a specific product.
+      Categories are: Electronics, Furniture, Office Supply.
+      Examples: "Show me all electronics", "List furniture items",
+      "What office supplies do we have?", "Show all products in Electronics".
+      Do NOT use if a specific product name is mentioned.
+      Do NOT use if no category is mentioned.
     sql_template: >
       SELECT name, price, stock_quantity, supplier
       FROM products
@@ -85,7 +117,12 @@ intents:
     result_description: "Products in a category"
 
   order_history:
-    description: "Get recent orders with product and employee details"
+    description: >
+      Use this ONLY when the question asks to see ALL recent orders
+      with no filter on status.
+      Examples: "Show me all recent orders", "What are the latest orders?",
+      "Show order history", "List all orders".
+      Do NOT use if a specific status like pending, shipped, delivered is mentioned.
     sql_template: >
       SELECT o.id AS order_id, p.name AS product, o.quantity,
              o.order_date, o.status, e.name AS ordered_by
@@ -99,7 +136,13 @@ intents:
     result_description: "Recent order history"
 
   order_by_status:
-    description: "Get orders filtered by their status"
+    description: >
+      Use this ONLY when the question asks for orders filtered by a
+      SPECIFIC STATUS: pending, processing, shipped, delivered, or cancelled.
+      Examples: "Show me all pending orders", "List shipped orders",
+      "What orders are processing?", "Show delivered orders",
+      "Which orders were cancelled?".
+      REQUIRES a status word in the question.
     sql_template: >
       SELECT o.id AS order_id, p.name AS product, o.quantity,
              o.order_date, e.name AS ordered_by
@@ -113,21 +156,70 @@ intents:
     optional_params: []
     result_description: "Orders filtered by status"
 
-# Fallback — when no intent matches
+  department_salaries:
+    description: >
+      Use this ONLY when the question asks to COMPARE salaries within a
+      department, or asks who is the highest/lowest/best paid in a department,
+      or asks to rank employees by salary in a department.
+      Examples: "Who is the highest paid in Engineering?",
+      "Is Alan Turing the top earner in Engineering?",
+      "Rank salaries in Marketing", "Who earns the most in Sales?".
+      REQUIRES a department name.
+    sql_template: >
+      SELECT e.name, e.role, e.salary
+      FROM employees e
+      JOIN departments d ON e.department_id = d.id
+      WHERE d.name LIKE %(department_name)s
+      ORDER BY e.salary DESC
+    required_params:
+      - department_name
+    optional_params: []
+    result_description: "All employee salaries in a department ranked highest to lowest"
+
+  product_most_expensive:
+    description: >
+      Use this ONLY when the question asks which product is the most expensive,
+      highest priced, costs the most, or asks to rank products by price.
+      Examples: "What is the most expensive product?",
+      "Which product costs the most?", "What is our priciest item?",
+      "Show me products ranked by price".
+      No parameters required.
+    sql_template: >
+      SELECT name, category, price, stock_quantity, supplier
+      FROM products
+      ORDER BY price DESC
+      LIMIT 5
+    required_params: []
+    optional_params: []
+    result_description: "Top 5 most expensive products ranked by price"
+
   other:
-    description: "Question does not match any known database query"
+    description: >
+      Use this ONLY when the question does not match any of the above intents,
+      or asks about something completely unrelated to employees, departments,
+      products, or orders.
+      Examples: "What is the weather?", "Tell me a joke", "What is AI?".
     sql_template: ""
     required_params: []
     optional_params: []
     result_description: "No matching query available"
 
 
-# MODEL ROUTING CONFIG
 models:
-  fast_model: "qwen2.5:1.5b"        # Used for intent classification + param extraction
-  synthesis_model: "qwen2.5:1.5b"    # Used for answer synthesis + self-healing messages
+  fast_model: "phi3:mini"
+  extraction_model: "phi3:mini"
+  synthesis_model: "qwen2.5:1.5b"
+  embed_model: "nomic-embed-text:latest"
   ollama_base_url: "http://localhost:11434"
-  intent_temperature: 0.0            # Zero — we want deterministic classification
-  synthesis_temperature: 0.3         # Slight warmth for natural language output
-  max_tokens_intent: 50              # Intent is ONE word — cap tokens
-  max_tokens_synthesis: 500          # Full answer
+  intent_temperature: 0.0
+  synthesis_temperature: 0.1
+  extraction_temperature: 0.0
+  max_tokens_intent: 50
+  max_tokens_extraction: 250
+  max_tokens_synthesis: 350
+  extraction_num_ctx: 2048
+  synthesis_num_ctx: 2048
+  keep_alive: "10m"
+  ollama_timeout: 180
+  semantic_cache_threshold: 0.92
+  semantic_cache_max_entries: 500

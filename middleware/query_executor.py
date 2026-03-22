@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import yaml
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
@@ -51,34 +52,28 @@ def _get_connection() -> mysql.connector.MySQLConnection:
     return _get_pool().get_connection()
 
 
-def _build_empty_result_message(question: str, description: str) -> str:
-    q_lower = question.lower()
+def _load_schema() -> dict:
+    schema_path = Path(__file__).parent.parent / "config" / "graph_schema.yaml"
+    with open(schema_path, "r") as f:
+        return yaml.safe_load(f)
 
-    if any(w in q_lower for w in ["who", "which employee", "list employee"]):
-        return (
-            "No employees were found matching your criteria. "
-            "Please check the name, department, or role and try again."
-        )
-    if any(w in q_lower for w in ["department", "dept", "team"]):
-        return (
-            "No department was found matching your criteria. "
-            "Please verify the department name and try again."
-        )
-    if any(w in q_lower for w in ["product", "stock", "inventory"]):
-        return (
-            "No products were found matching your search. "
-            "Please check the product name or category and try again."
-        )
-    if any(w in q_lower for w in ["order", "purchase"]):
-        return (
-            "No orders were found matching your criteria. "
-            "You can try filtering by a different status or date range."
-        )
-    if any(w in q_lower for w in ["project", "initiative"]):
-        return (
-            "No projects were found matching your criteria. "
-            "Please check the project name or status filter."
-        )
+
+def _build_empty_result_message(question: str, description: str) -> str:
+    """
+    Return an entity-specific empty-result message by matching the question
+    against each node's empty_result_keywords list in graph_schema.yaml.
+
+    Schema-driven: adding a new entity with empty_result_hint and
+    empty_result_keywords requires only a YAML edit — zero Python changes.
+    """
+    q_lower = question.lower()
+    schema = _load_schema()
+
+    for node_data in schema.get("nodes", {}).values():
+        hint = node_data.get("empty_result_hint", "")
+        keywords = node_data.get("empty_result_keywords", [])
+        if hint and any(kw in q_lower for kw in keywords):
+            return hint
 
     return (
         "No records were found for your query. "

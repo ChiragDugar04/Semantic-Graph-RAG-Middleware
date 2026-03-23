@@ -614,6 +614,58 @@ def _post_process_delta(
     return result.model_copy(update={"filters": new_filters})
 
 
+def _post_process_project_manager_lookup(
+    result: EntityExtractionResult,
+    question_normalized: str,
+) -> EntityExtractionResult:
+    """
+    Detects "who manages / who leads / who is in charge of [project]" questions
+    and rewrites the extraction so the query builder returns only the manager,
+    NOT all project_assignment rows.
+
+    Detection: schema-driven via Project.manager_lookup_triggers in graph_schema.yaml.
+    Action: inject filter key "project_manager_only"="true" and collapse entities
+            to ["Project"] only (single-node lookup — no junction join needed).
+
+    The query builder (_build_project_manager_query) reads project_manager_only
+    and emits:
+        SELECT mgr.name AS manager_name, proj.name AS project_name, ...
+        FROM projects proj
+        JOIN employees mgr ON mgr.id = proj.manager_id
+        WHERE proj.name LIKE %(project_name)s
+    """
+    schema = _load_schema()
+    triggers = (
+        schema.get("nodes", {})
+              .get("Project", {})
+              .get("manager_lookup_triggers", [])
+    )
+    if not triggers:
+        return result
+
+    matched = any(trigger in question_normalized for trigger in triggers)
+    if not matched:
+        return result
+
+    # Only fire when a project_name filter exists (otherwise it's too broad)
+    has_project_filter = "project_name" in result.filters
+
+    new_filters = dict(result.filters)
+    new_filters["project_manager_only"] = "true"
+
+    logger.info(
+        "post_process: project_manager_lookup detected — "
+        "injecting project_manager_only filter (project_name present=%s)",
+        has_project_filter,
+    )
+
+    return result.model_copy(update={
+        "entities": ["Project"],
+        "filters": new_filters,
+        "question_type": "lookup",
+    })
+
+
 def _schema_aggregation_fallback(
     question_normalized: str,
 ) -> Optional[EntityExtractionResult]:
@@ -715,6 +767,7 @@ def extract_entities(
     result = _post_process_having_count(result, question_normalized)
     result = _post_process_temporal(result, question_normalized)
     result = _post_process_delta(result, question_normalized)
+    result = _post_process_project_manager_lookup(result, question_normalized)
 
     result.latency_ms = latency_ms
 

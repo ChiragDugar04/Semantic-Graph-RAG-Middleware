@@ -382,6 +382,23 @@ nodes:
     alias: proj
     display_name: "Project"
 
+    # Phrases that mean "tell me who the manager of a project is"
+    # (as opposed to "who is assigned/working on a project").
+    # Detected in entity_extractor post-processing → sets project_manager_only filter.
+    manager_lookup_triggers:
+      - "who manages"
+      - "who is managing"
+      - "who managed"
+      - "who is the manager of"
+      - "who is manager of"
+      - "project manager of"
+      - "project lead of"
+      - "who leads"
+      - "who is leading"
+      - "who is in charge of"
+      - "who runs"
+      - "who is running"
+
     selectable_columns:
       - column: name
         alias: project_name

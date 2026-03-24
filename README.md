@@ -48,9 +48,8 @@ The pipeline consists of 7 sequential phases, all orchestrated by `pipeline.py`:
 | 7 — Answer Synthesis | `answer_synthesizer.py` | LLM (qwen2.5:1.5b) generates natural language answer with contradiction guard |
 
 ---
-
 ## 📁 Project Structure
-
+ 
 ```
 .
 ├── middleware/
@@ -68,10 +67,10 @@ The pipeline consists of 7 sequential phases, all orchestrated by `pipeline.py`:
 │   ├── graph_schema.yaml        # ⭐ Central schema — entities, edges, filters, rules
 │   ├── intents.yaml             # Model config (Ollama endpoints, temperatures)
 │   └── db_config.yaml           # MySQL connection settings
+├── database/
+│   ├── schema.sql               # MySQL DDL
+│   └── seed.sql                 # Sample data (17 employees, 6 projects, 16 orders…)
 ├── app.py                       # Streamlit UI with glass-box audit trail
-├── test_pipeline.py             # 25-question regression test suite
-├── schema.sql                   # MySQL DDL
-├── seed.sql                     # Sample data (17 employees, 6 projects, 16 orders…)
 ├── requirements.txt
 └── assets/
     └── Screenshot_2026-03-20_115202.png

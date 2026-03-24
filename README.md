@@ -73,7 +73,7 @@ The pipeline consists of 7 sequential phases, all orchestrated by `pipeline.py`:
 ├── app.py                       # Streamlit UI with glass-box audit trail
 ├── requirements.txt
 └── assets/
-    └── Screenshot_2026-03-20_115202.png
+    └── Architecture.png
 ```
 
 ---

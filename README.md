@@ -1,8 +1,8 @@
-# 🕸️Semantic Graph RAG Assistant
+# 🕸️ Semantic Graph RAG Assistant
 
 A production-grade, schema-driven **Retrieval-Augmented Generation (RAG)** system that answers natural language questions about company data using a **semantic graph**, **local LLMs via Ollama**, and **MySQL** — with no vector database required.
 
-![Architecture Diagram](assests/Screenshot 2026-03-20 115202.png)
+![Architecture Diagram](assets/Screenshot_2026-03-20_115202.png)
 
 ---
 

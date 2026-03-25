@@ -122,9 +122,6 @@ class SemanticGraph:
 
     @property
     def _schema_node_names(self) -> List[str]:
-        # T2-A: returns nodes in YAML insertion order (Python 3.7+ dict order),
-        # which is the detection priority order. Used by _expand_entities_from_filters
-        # generic loop to build the entity_lower→entity prefix map.
         return list(self._nodes.keys())
 
     def get_node_data(self, entity: str) -> Dict[str, Any]:
@@ -244,10 +241,6 @@ class SemanticGraph:
                 edge_data["from_node"] = from_node
                 edge_data["to_node"] = to_node
             elif self._graph.has_edge(anchor, to_node):
-                # Fan-out topology: no direct edge from_node→to_node, but the
-                # path anchor has a direct edge to to_node (e.g. Order→Product
-                # when path is [Order, Employee, Product]).  Use the anchor's
-                # edge so both JOINs reference the same root table.
                 edge_data = dict(self._graph[anchor][to_node])
                 edge_data["from_node"] = anchor
                 edge_data["to_node"] = to_node

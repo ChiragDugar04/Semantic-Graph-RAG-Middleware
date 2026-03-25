@@ -59,13 +59,7 @@ def _load_schema() -> dict:
 
 
 def _build_empty_result_message(question: str, description: str) -> str:
-    """
-    Return an entity-specific empty-result message by matching the question
-    against each node's empty_result_keywords list in graph_schema.yaml.
-
-    Schema-driven: adding a new entity with empty_result_hint and
-    empty_result_keywords requires only a YAML edit — zero Python changes.
-    """
+    
     q_lower = question.lower()
     schema = _load_schema()
 

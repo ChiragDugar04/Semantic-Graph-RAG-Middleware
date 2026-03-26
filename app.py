@@ -384,12 +384,6 @@ def main() -> None:
     if not st.session_state.messages:
         st.info(
             "👋 Welcome! Ask a question about the company database.\n\n"
-            "**Try:**\n"
-            "- *What is Alan Turing's salary?*\n"
-            "- *List all employees in Engineering*\n"
-            "- *Which employees are assigned to the API Gateway Rebuild project?*\n"
-            "- *Show me all pending orders*\n"
-            "- *Who is the highest paid in Marketing?*"
         )
 
     prompt = st.chat_input("Ask about employees, departments, products, orders, or projects…")

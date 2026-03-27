@@ -29,7 +29,7 @@ Graph RAG Assistant translates plain English questions into structured MySQL que
 - **Fuzzy name resolution** — corrects misspelled names (e.g. `"Leslie Knop"` → `"Leslie Knope"`) using `rapidfuzz` before query execution
 - **Self-healing** — graceful fallback with entity-specific error messages when queries return no results
 - **Glass-box UI** — full audit trail in the Streamlit sidebar: SQL executed, path taken, filters applied, latency breakdown
-- **25-question regression suite** — `test_pipeline.py` validates extraction, path, row count, and answer quality end-to-end
+  
 
 ---
 

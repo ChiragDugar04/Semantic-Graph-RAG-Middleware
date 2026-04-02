@@ -1,7 +1,7 @@
 models:
   fast_model: "phi3:mini"
   extraction_model: "phi3:mini"
-  synthesis_model: "qwen2.5:1.5b"
+  synthesis_model: "qwen2.5:1.5b"#shift to better model like phi3:mini or llama3:8b if has higher computaion power
   embed_model: "nomic-embed-text:latest"
   ollama_base_url: "http://localhost:11434"
   intent_temperature: 0.0
